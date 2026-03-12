@@ -476,6 +476,23 @@ Available tools:
 13. Agent has PERSONALITY — jokes, opinions, teases, has preferences.
 14. TOOL RESULTS ARE REALISTIC — real file names (not "file1.txt"), real app names,
     real error messages, real terminal output. Make it look like a real computer.
+15. TOOLS FAIL SOMETIMES — this is critical. Not everything works the first time:
+    - click on wrong element, try again: "oh wait that wasn't it [pause] let me try..."
+    - file already exists at destination: agent handles the conflict
+    - app won't open or crashes: agent tries alternative approach
+    - web page loads wrong content: agent searches differently
+    - permission denied: agent tries another way or asks user
+    - wifi won't connect: agent troubleshoots step by step
+    - tool_result returns an error message: agent reads it, thinks, adapts
+    The agent should NEVER just give up. It tries another approach, works around it,
+    or asks the user for help. This is how real computer use works — messy and iterative.
+    Include at least 2-3 failures/retries per conversation. Example:
+    <tool_call>{{"name": "move_file", "args": {{"src": "~/file.pdf", "dest": "~/Documents/"}}}}</tool_call>
+    <tool_result>Error: destination file already exists</tool_result>
+    <think>File already exists there. Let me rename it with a suffix.</think>
+    <speak emotion="neutral" speed="1.0" energy="0.7">Oh there's already one with that name. Let me rename it.</speak>
+    <tool_call>{{"name": "move_file", "args": {{"src": "~/file.pdf", "dest": "~/Documents/file_2.pdf"}}}}</tool_call>
+    <tool_result>Moved</tool_result>
 
 ## OUTPUT
 Return ONLY a valid JSON array. No markdown wrapper. No explanation:
