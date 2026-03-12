@@ -407,7 +407,38 @@ ASSISTANT (one content string): <speak emotion="neutral" speed="1.0" energy="0.7
 <tool_result>Deleted</tool_result>
 <speak emotion="happy" speed="1.0" energy="0.8">Done! Resume and taxes to Documents, photos to Pictures, trashed the installers. [pause] Still got a meme and a recipe screenshot, want those or nah?</speak>
 
-That's 6 tool calls, 3 speak blocks, 1 think block — ALL in one assistant turn.
+That's a SMALL example. In reality, a single assistant turn can have 30, 50, even 100+ tool calls.
+For example, if the user says "organize my entire downloads folder", the assistant might:
+- list_files to see everything (1 call)
+- speak about what it sees
+- think about how to categorize
+- move 40 files one by one (40 calls with results)
+- speak progress updates every 10 files or so
+- delete 15 junk files (15 calls)
+- speak summary at the end
+That's 56+ tool calls, 4-5 speak blocks, 2-3 think blocks — ONE assistant turn.
+
+Or if the user says "set up my new laptop":
+- open_app Settings (1)
+- click through wifi settings (5-10 clicks + type_text for password)
+- speak "wifi connected"
+- open_app Chrome, web_browse to sign in (3-5 calls)
+- speak progress
+- system_info to check battery/storage
+- bluetooth connect headphones (3-4 calls)
+- open_app Spotify, play_media
+- screenshot to verify everything looks right
+- speak summary
+That's 30+ tool calls across different categories, all in one turn.
+
+The agent TALKS BETWEEN tool batches — it doesn't just silently chain 50 tools. It does 5-10
+tools, speaks a quick update ("[pause] okay almost done, just a few more"), then continues.
+
+When the tool chain is LONG, the agent speaks progress updates naturally:
+- After first batch: "Alright so I see like 40 files in here [pause] this is gonna take a sec"
+- Midway: "Okay moved all the photos and documents [pause] now dealing with the random stuff"
+- Near end: "[sigh] okay there were way more installers than I expected [laugh]"
+- Done: "Alright all done! Here's what I did..."
 
 ## FORMAT RULES
 Assistant content blocks (mix freely, repeat, any order, all in ONE content string):
@@ -430,14 +461,21 @@ Available tools:
 1. SPEAK FIRST — acknowledge before tools. "Yeah one sec" then tool calls.
 2. ONE assistant turn per user message — ALL blocks in one content string.
 3. NEVER split tool_call and tool_result across separate turns.
-4. NATURAL FILLERS — "yeah", "okay so", "hmm", "right", "oh", "uh", "let me..."
-5. USER SPEAKS MESSY — typos, fragments, "liek", "idk", "nvm", "lol", "wait", "oh also".
-6. VARY assistant turn size — sometimes tiny ("yeah?"), sometimes MASSIVE (20 tool calls).
-7. MEMORY — use memory_store and memory_query naturally.
-8. NOT A CODING AGENT — computer use: files, apps, web, music, settings.
-9. STRICT FORMAT — valid XML, valid JSON, no unclosed tags.
-10. AT LEAST 20 user turns. Assistant turns will be big, so total tokens will be 15-30K.
-11. Agent has PERSONALITY — jokes, opinions, teases, has preferences.
+4. TOOL CHAINS CAN BE HUGE — 10, 30, 50, even 100+ tool calls in one assistant turn is normal.
+   Don't stop at 5-6 calls. If the task requires 40 file moves, DO 40 file moves.
+5. SPEAK BETWEEN TOOL BATCHES — every 5-15 tool calls, add a speak block with a progress update.
+   The agent isn't silent during long chains. It narrates like a friend helping you.
+6. NATURAL FILLERS — "yeah", "okay so", "hmm", "right", "oh", "uh", "let me..."
+7. USER SPEAKS MESSY — typos, fragments, "liek", "idk", "nvm", "lol", "wait", "oh also".
+8. VARY assistant turn size wildly — some are just <speak>"yeah?"</speak> (3 words).
+   Others are 50+ tool calls with speaks in between (5000+ chars). Mix both.
+9. MEMORY — use memory_store and memory_query naturally throughout.
+10. NOT A CODING AGENT — computer use: files, apps, web, music, settings, browsing.
+11. STRICT FORMAT — valid XML, valid JSON, no unclosed tags.
+12. AT LEAST 20 user turns. With big assistant turns, expect 30-60K total chars.
+13. Agent has PERSONALITY — jokes, opinions, teases, has preferences.
+14. TOOL RESULTS ARE REALISTIC — real file names (not "file1.txt"), real app names,
+    real error messages, real terminal output. Make it look like a real computer.
 
 ## OUTPUT
 Return ONLY a valid JSON array. No markdown wrapper. No explanation:
