@@ -136,6 +136,128 @@ def validate_conversation(turns: list[dict]) -> tuple[bool, str]:
 
 
 # =============================================================================
+# Post-processing — fix common LLM generation issues
+# =============================================================================
+
+# Map common invalid emotions to valid ones
+EMOTION_FIXES = {
+    "warm": "happy",
+    "friendly": "happy",
+    "cheerful": "happy",
+    "curious": "neutral",
+    "thoughtful": "calm",
+    "concerned": "empathetic",
+    "playful": "amused",
+    "sarcastic": "amused",
+    "annoyed": "angry",
+    "worried": "nervous",
+    "relieved": "calm",
+    "content": "calm",
+    "enthusiastic": "excited",
+    "skeptical": "confused",
+    "tender": "empathetic",
+    "wistful": "sad",
+    "reassuring": "calm",
+}
+
+
+def postprocess_turns(turns: list[dict]) -> list[dict]:
+    """Fix common issues in LLM-generated turns.
+
+    1. Merge consecutive assistant turns into one (the big one)
+    2. Merge consecutive user turns
+    3. Fix invalid emotions
+    4. Remove empty turns
+    5. Ensure proper alternation: user → assistant (with system anywhere)
+    """
+    if not turns:
+        return turns
+
+    # Step 1: Fix emotions in all content
+    fixed = []
+    for turn in turns:
+        content = turn.get("content", "")
+        if not content.strip():
+            continue
+
+        # Fix invalid emotions
+        for bad, good in EMOTION_FIXES.items():
+            content = content.replace(f'emotion="{bad}"', f'emotion="{good}"')
+
+        fixed.append({"role": turn["role"], "content": content})
+
+    # Step 2: Merge consecutive same-role turns
+    merged = []
+    for turn in fixed:
+        if not merged:
+            merged.append(turn)
+            continue
+
+        prev = merged[-1]
+        if turn["role"] == prev["role"]:
+            # Merge into previous turn
+            prev["content"] = prev["content"].rstrip() + "\n" + turn["content"].lstrip()
+        else:
+            merged.append(turn)
+
+    # Step 3: Ensure it starts with user or system, ends with assistant
+    while merged and merged[0]["role"] == "assistant":
+        merged.pop(0)
+    while merged and merged[-1]["role"] == "user":
+        merged.pop()
+
+    # Step 4: Validate alternation — if two users in a row somehow survived,
+    # merge them. If two assistants survived (shouldn't happen after step 2), merge.
+    final = []
+    for turn in merged:
+        if not final:
+            final.append(turn)
+            continue
+        prev = final[-1]
+        if turn["role"] == prev["role"] and turn["role"] != "system":
+            prev["content"] = prev["content"].rstrip() + "\n" + turn["content"].lstrip()
+        else:
+            final.append(turn)
+
+    return final
+
+
+def compute_turn_stats(turns: list[dict]) -> dict:
+    """Compute statistics for a conversation."""
+    total_chars = sum(len(t.get("content", "")) for t in turns)
+    user_turns = sum(1 for t in turns if t["role"] == "user")
+    assistant_turns = sum(1 for t in turns if t["role"] == "assistant")
+    system_turns = sum(1 for t in turns if t["role"] == "system")
+
+    # Count blocks across all assistant turns
+    all_assistant = " ".join(t["content"] for t in turns if t["role"] == "assistant")
+    num_speak = len(SPEAK_BLOCK.findall(all_assistant))
+    num_tool_calls = len(TOOL_CALL_BLOCK.findall(all_assistant))
+    num_think = len(THINK_BLOCK.findall(all_assistant))
+    num_interrupts = all_assistant.count("<interrupted/>")
+
+    # Average assistant turn length
+    asst_lengths = [len(t["content"]) for t in turns if t["role"] == "assistant"]
+    avg_asst_len = sum(asst_lengths) / len(asst_lengths) if asst_lengths else 0
+    max_asst_len = max(asst_lengths) if asst_lengths else 0
+
+    return {
+        "num_turns": len(turns),
+        "user_turns": user_turns,
+        "assistant_turns": assistant_turns,
+        "system_turns": system_turns,
+        "num_speak": num_speak,
+        "num_tool_calls": num_tool_calls,
+        "num_think": num_think,
+        "num_interrupts": num_interrupts,
+        "total_chars": total_chars,
+        "est_tokens": total_chars // 4,
+        "avg_assistant_chars": int(avg_asst_len),
+        "max_assistant_chars": max_asst_len,
+    }
+
+
+# =============================================================================
 # Fragment pool — collect real data fragments from all sources
 # =============================================================================
 
@@ -239,7 +361,7 @@ STITCHER_PROMPT = """You are creating training data for a living AI computer age
 - Gets INTERRUPTED and handles it gracefully
 
 ## YOUR TASK
-Create a LONG, realistic conversation (50-100 turns, 15,000-30,000 tokens) for this scenario:
+Create a LONG, realistic conversation for this scenario:
 
 **Domain**: {domain}
 **Scenario**: {scenario}
@@ -253,50 +375,75 @@ These are REAL tool calls and results from actual computer use. Incorporate them
 
 {fragments}
 
-## FORMAT (STRICT — must be exactly this)
-Each turn is a JSON object with "role" and "content".
+## TURN STRUCTURE — THIS IS THE MOST IMPORTANT PART
 
-Assistant content MUST use these blocks (can be mixed, in any order, multiple times):
-  <think>internal reasoning — never spoken aloud</think>
+A conversation STRICTLY alternates: user turn -> assistant turn -> user turn -> assistant turn.
+System turns (events like notifications, timers) can appear between any turns.
+
+The user says ONE thing per turn — short, casual, messy.
+
+The assistant packs EVERYTHING into ONE turn — this is critical. A single assistant turn
+contains ALL the think blocks, tool calls, tool results, and speak blocks for that response.
+The assistant might speak, then call 10 tools with results, then speak again — all in ONE
+content string. Example:
+
+USER: "hey can you clean up my downloads"
+ASSISTANT (one content string): <speak emotion="neutral" speed="1.0" energy="0.7">Yeah one sec let me see what you got in there.</speak>
+<tool_call>{{"name": "list_files", "args": {{"path": "~/Downloads"}}}}</tool_call>
+<tool_result>resume_v3_FINAL.pdf  IMG_4821.jpg  IMG_4822.jpg  setup.exe  setup(1).exe  recipe.png  meme.jpg  taxes.pdf</tool_result>
+<think>Tons of junk. PDFs, images, old installers. Sort by type.</think>
+<speak emotion="amused" speed="1.1" energy="0.9">[chuckle] Resume v3 FINAL, two old installers, some photos and a meme. Let me sort this out.</speak>
+<tool_call>{{"name": "move_file", "args": {{"src": "~/Downloads/resume_v3_FINAL.pdf", "dest": "~/Documents/Resumes/"}}}}</tool_call>
+<tool_result>Moved</tool_result>
+<tool_call>{{"name": "move_file", "args": {{"src": "~/Downloads/taxes.pdf", "dest": "~/Documents/Finance/"}}}}</tool_call>
+<tool_result>Moved</tool_result>
+<tool_call>{{"name": "move_file", "args": {{"src": "~/Downloads/IMG_4821.jpg", "dest": "~/Pictures/"}}}}</tool_call>
+<tool_result>Moved</tool_result>
+<tool_call>{{"name": "move_file", "args": {{"src": "~/Downloads/IMG_4822.jpg", "dest": "~/Pictures/"}}}}</tool_call>
+<tool_result>Moved</tool_result>
+<tool_call>{{"name": "delete_file", "args": {{"path": "~/Downloads/setup.exe"}}}}</tool_call>
+<tool_result>Deleted</tool_result>
+<tool_call>{{"name": "delete_file", "args": {{"path": "~/Downloads/setup(1).exe"}}}}</tool_call>
+<tool_result>Deleted</tool_result>
+<speak emotion="happy" speed="1.0" energy="0.8">Done! Resume and taxes to Documents, photos to Pictures, trashed the installers. [pause] Still got a meme and a recipe screenshot, want those or nah?</speak>
+
+That's 6 tool calls, 3 speak blocks, 1 think block — ALL in one assistant turn.
+
+## FORMAT RULES
+Assistant content blocks (mix freely, repeat, any order, all in ONE content string):
+  <think>internal reasoning — never spoken</think>
   <tool_call>{{"name": "tool_name", "args": {{}}}}</tool_call>
-  <tool_result>realistic output — use the real fragments above when possible</tool_result>
+  <tool_result>realistic output</tool_result>
   <speak emotion="EMOTION" speed="FLOAT" energy="FLOAT">spoken text with [tags]</speak>
   <interrupted/>
 
-EVERY <speak> block MUST have all three attributes: emotion, speed, energy.
-EVERY <tool_call> MUST have valid JSON with "name" and "args".
+EVERY <speak> MUST have emotion, speed, energy. EVERY <tool_call> MUST have valid JSON.
 EVERY opening tag MUST have a matching closing tag.
-
-Speech tags: [laugh] [chuckle] [sigh] [gasp] [cough] [clear throat] [sniff] [groan] [shush] [pause]
 Emotions: neutral, happy, sad, angry, excited, empathetic, surprised, nervous, calm, amused, confused
-Speed: 0.5 (slow) to 1.5 (fast). Energy: 0.3 (quiet) to 1.5 (loud).
+Speech tags: [laugh] [chuckle] [sigh] [gasp] [cough] [clear throat] [sniff] [groan] [shush] [pause]
+Speed: 0.5-1.5. Energy: 0.3-1.5.
 
-Available tools (use by name in tool_call):
+Available tools:
 {tool_list}
 
-## CRITICAL RULES
-1. SPEAK FIRST — always acknowledge before using tools. "Yeah one sec" then tool call.
-2. NATURAL FILLERS — "yeah", "okay so", "hmm", "right", "oh", "let me..."
-3. EMOTIONS SHIFT — start one way, shift based on what happens.
-4. LONG CONVERSATION — at LEAST 50 turns. This is a real session, not a demo.
-5. REAL TOOL RESULTS — use the fragments provided. Don't make up fake terminal output.
-6. MEMORY OPERATIONS — store important things, recall when relevant.
-7. INTERRUPTIONS — user goes off-topic, agent handles it, comes back.
-8. NOT A CODING AGENT — this is a general computer use agent. Files, apps, web, settings.
-9. STRICT FORMAT — every block must be valid. No malformed XML. No unclosed tags.
-10. USER SPEAKS NATURALLY — typos, fragments, casual language. Not formal.
-11. Include MULTIPLE speak blocks per assistant turn when the agent is chatting between tools.
-12. VARY turn length — some turns are one line ("yeah?" / "hmm one sec"), some are paragraphs.
+## RULES
+1. SPEAK FIRST — acknowledge before tools. "Yeah one sec" then tool calls.
+2. ONE assistant turn per user message — ALL blocks in one content string.
+3. NEVER split tool_call and tool_result across separate turns.
+4. NATURAL FILLERS — "yeah", "okay so", "hmm", "right", "oh", "uh", "let me..."
+5. USER SPEAKS MESSY — typos, fragments, "liek", "idk", "nvm", "lol", "wait", "oh also".
+6. VARY assistant turn size — sometimes tiny ("yeah?"), sometimes MASSIVE (20 tool calls).
+7. MEMORY — use memory_store and memory_query naturally.
+8. NOT A CODING AGENT — computer use: files, apps, web, music, settings.
+9. STRICT FORMAT — valid XML, valid JSON, no unclosed tags.
+10. AT LEAST 20 user turns. Assistant turns will be big, so total tokens will be 15-30K.
+11. Agent has PERSONALITY — jokes, opinions, teases, has preferences.
 
 ## OUTPUT
-Return ONLY a valid JSON array of turn objects:
-[
-  {{"role": "user", "content": "hey can you..."}},
-  {{"role": "assistant", "content": "<speak ...>...</speak>\\n<tool_call>...</tool_call>..."}},
-  ...
-]
+Return ONLY a valid JSON array. No markdown wrapper. No explanation:
+[{{"role": "user", "content": "..."}}, {{"role": "assistant", "content": "..."}}, ...]
 
-Generate the full conversation now. Make it LONG and REAL."""
+Generate the full conversation now. Make it feel REAL."""
 
 
 def build_tool_list() -> str:
@@ -598,6 +745,9 @@ def generate_hybrid_dataset(
                 response = call_llm(prompt, provider=provider, model=model, api_key=api_key)
                 turns = extract_json_array(response)
 
+                # Post-process: merge consecutive assistant turns, fix emotions
+                turns = postprocess_turns(turns)
+
                 # Validate
                 is_valid, err = validate_conversation(turns)
                 if not is_valid:
@@ -606,6 +756,7 @@ def generate_hybrid_dataset(
                     continue
 
                 validated += 1
+                stats = compute_turn_stats(turns)
 
                 record = {
                     "id": sample_id,
@@ -613,13 +764,7 @@ def generate_hybrid_dataset(
                     "scenario": config["scenario"],
                     "config": config,
                     "turns": turns,
-                    "stats": {
-                        "num_turns": len(turns),
-                        "num_speak": sum(1 for t in turns if "<speak" in t.get("content", "")),
-                        "num_tool_calls": sum(t.get("content", "").count("<tool_call>") for t in turns),
-                        "num_think": sum(t.get("content", "").count("<think>") for t in turns),
-                        "total_chars": sum(len(t.get("content", "")) for t in turns),
-                    },
+                    "stats": stats,
                     "generator": {"provider": provider, "model": model or "default"},
                 }
 
@@ -629,10 +774,11 @@ def generate_hybrid_dataset(
 
                 elapsed = time.time() - start_time
                 rate = generated / elapsed if elapsed > 0 else 0
-                stats = record["stats"]
                 print(f"  [{generated}/{num_samples}] {config['domain']}/{config['scenario'][:30]} "
-                      f"— {stats['num_turns']}t, {stats['num_speak']}s, {stats['num_tool_calls']}tc "
-                      f"({stats['total_chars']//1000}K chars) [{rate:.2f}/s]")
+                      f"— {stats['user_turns']}u/{stats['assistant_turns']}a turns, "
+                      f"{stats['num_speak']}s, {stats['num_tool_calls']}tc, "
+                      f"{stats['est_tokens']//1000}K tok, "
+                      f"max_asst={stats['max_assistant_chars']//1000}K [{rate:.2f}/s]")
 
             except Exception as e:
                 failed += 1
