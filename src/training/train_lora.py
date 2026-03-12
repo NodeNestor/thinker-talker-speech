@@ -400,7 +400,10 @@ def main():
     # Resolve "auto" settings based on model size
     # Heuristic: models with "0.8B" or "2B" in the name are small, skip heavy quant
     _model_name_lower = args.model.lower()
-    _is_small_model = any(s in _model_name_lower for s in ["0.8b", "0.6b", "1b", "2b", "1.5b"])
+    # Use regex to avoid false positives like "1b" matching "21b" or "122b"
+    _size_match = re.search(r'(?:^|[^0-9])(\d+(?:\.\d+)?b)', _model_name_lower)
+    _model_size_str = _size_match.group(1) if _size_match else ""
+    _is_small_model = _model_size_str in ("0.6b", "0.8b", "1b", "1.5b", "2b", "3b")
     if args.quant_embed == "auto":
         args.quant_embed = not _is_small_model
     if args.quant_lmhead_fp8 == "auto":
@@ -427,7 +430,7 @@ def main():
     print(f"  CUDA devices: {os.environ.get('CUDA_VISIBLE_DEVICES', 'all')}")
     if torch.cuda.is_available():
         print(f"  GPU:          {torch.cuda.get_device_name(0)}")
-        print(f"  VRAM:         {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+        print(f"  VRAM:         {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     print()
 
     # ─── Load model ───
@@ -447,7 +450,7 @@ def main():
         print(f"  Multi-GPU: {_n_gpus} GPUs detected (weight offloading mode)")
         for i in range(_n_gpus):
             _name = torch.cuda.get_device_name(i)
-            _mem = torch.cuda.get_device_properties(i).total_mem / 1e9
+            _mem = torch.cuda.get_device_properties(i).total_memory / 1e9
             print(f"    GPU {i}: {_name} ({_mem:.1f} GB)")
     model, tokenizer = FastLanguageModel.from_pretrained(**_load_kwargs)
 
@@ -716,8 +719,9 @@ def main():
 
         def _masked_compute_loss(model, inputs, return_outputs=False, num_items_in_batch=None):
             if "labels" in inputs and tool_result_masker is not None:
+                # Clone to avoid double-masking if trainer recomputes loss
                 inputs["labels"] = tool_result_masker.mask_tool_results_in_labels(
-                    inputs["labels"], inputs["input_ids"]
+                    inputs["labels"].clone(), inputs["input_ids"]
                 )
             if num_items_in_batch is not None:
                 return _original_compute_loss(model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch)
@@ -729,8 +733,8 @@ def main():
     _lm_head_offloaded = False
     _embed_offloaded = False
     if _n_gpus > 1:
-        _gpu0_mem = torch.cuda.get_device_properties(0).total_mem
-        _gpu1_mem = torch.cuda.get_device_properties(1).total_mem
+        _gpu0_mem = torch.cuda.get_device_properties(0).total_memory
+        _gpu1_mem = torch.cuda.get_device_properties(1).total_memory
         if _gpu1_mem > _gpu0_mem:
             print(f"  WARNING: GPU 1 larger than GPU 0! Swap CUDA_VISIBLE_DEVICES.")
             _n_gpus = 1
@@ -738,7 +742,7 @@ def main():
     if _n_gpus > 1:
         _offload_dev = torch.device("cuda:1")
         _exec_dev = torch.device("cuda:0")
-        _gpu1_capacity = torch.cuda.get_device_properties(1).total_mem
+        _gpu1_capacity = torch.cuda.get_device_properties(1).total_memory
         _gpu1_used = 0
         _gpu1_limit = int(_gpu1_capacity * 0.90)
         _offloaded_bytes = 0
