@@ -122,15 +122,24 @@ def validate_conversation(turns: list[dict]) -> tuple[bool, str]:
             return False, f"Turn {i}: {err}"
 
     # Check alternation (user/assistant, with system allowed anywhere)
-    last_role = None
+    # System turns can appear between any turns without breaking alternation.
+    # user→system→user is fine (system event injected between user messages).
+    # user→user (no system between) should be caught by postprocessing merge.
+    last_nonsys_role = None
+    consecutive_user = 0
     for turn in turns:
         role = turn["role"]
         if role == "system":
             continue
-        if role == last_role and role != "assistant":
-            # Allow consecutive assistant (tool chains)
-            return False, f"Consecutive {role} turns"
-        last_role = role
+        if role == "user":
+            consecutive_user += 1
+            if consecutive_user > 4:
+                # Allow several consecutive user turns (system events between,
+                # or user sending multiple messages before agent responds)
+                return False, f"Too many consecutive user turns ({consecutive_user})"
+        else:
+            consecutive_user = 0
+        last_nonsys_role = role
 
     return True, ""
 
@@ -158,27 +167,94 @@ EMOTION_FIXES = {
     "tender": "empathetic",
     "wistful": "sad",
     "reassuring": "calm",
+    "engaged": "neutral",
+    "focused": "neutral",
+    "determined": "calm",
+    "proud": "happy",
+    "grateful": "happy",
+    "apologetic": "empathetic",
+    "frustrated": "angry",
+    "disappointed": "sad",
+    "bored": "neutral",
+    "impressed": "surprised",
+    "sympathetic": "empathetic",
+    "confident": "calm",
+    "humorous": "amused",
+    "serious": "neutral",
+    "gentle": "calm",
+    "matter-of-fact": "neutral",
+    "helpful": "neutral",
+    "patient": "calm",
+    "encouraging": "happy",
 }
+
+
+def _fix_unclosed_tags(content: str) -> str:
+    """Fix mismatched XML-style tags in assistant content."""
+    for tag in ["think", "speak", "tool_call", "tool_result"]:
+        opens = content.count(f"<{tag}")
+        closes = content.count(f"</{tag}>")
+        if opens > closes:
+            # Missing close tags — append them
+            for _ in range(opens - closes):
+                content = content.rstrip() + f"</{tag}>"
+        elif closes > opens:
+            # Extra close tags — remove from the end
+            for _ in range(closes - opens):
+                idx = content.rfind(f"</{tag}>")
+                if idx >= 0:
+                    content = content[:idx] + content[idx + len(f"</{tag}>"):]
+    return content
+
+
+def _fix_tool_call_json(content: str) -> str:
+    r"""Fix common JSON issues in <tool_call> blocks.
+
+    LLMs often generate Windows paths with unescaped backslashes like:
+      C:\\Users\\foo  ->  valid JSON
+      C:\Users\foo   ->  INVALID (backslash-U is not a valid JSON escape)
+    """
+    def _fix_json_block(m):
+        raw = m.group(1)
+        try:
+            json.loads(raw)
+            return m.group(0)  # already valid
+        except json.JSONDecodeError:
+            # Fix unescaped backslashes: replace single \ with \\ but not already-escaped \\
+            fixed = re.sub(r'(?<!\\)\\(?![\\"/bfnrtu])', r'\\\\', raw)
+            try:
+                json.loads(fixed)
+                return f"<tool_call>{fixed}</tool_call>"
+            except json.JSONDecodeError:
+                return m.group(0)  # give up, return original
+
+    return re.sub(r"<tool_call>(.*?)</tool_call>", _fix_json_block, content, flags=re.DOTALL)
 
 
 def postprocess_turns(turns: list[dict]) -> list[dict]:
     """Fix common issues in LLM-generated turns.
 
-    1. Merge consecutive assistant turns into one (the big one)
-    2. Merge consecutive user turns
-    3. Fix invalid emotions
-    4. Remove empty turns
-    5. Ensure proper alternation: user → assistant (with system anywhere)
+    1. Fix unclosed tags in assistant content
+    2. Merge consecutive assistant turns into one (the big one)
+    3. Merge consecutive user turns
+    4. Fix invalid emotions
+    5. Remove empty turns
+    6. Ensure proper alternation: user → assistant (with system anywhere)
     """
     if not turns:
         return turns
 
-    # Step 1: Fix emotions in all content
+    # Step 1: Fix emotions and unclosed tags in all content
     fixed = []
     for turn in turns:
         content = turn.get("content", "")
         if not content.strip():
             continue
+
+        # Fix unclosed tags and broken JSON in assistant turns
+        if turn.get("role") == "assistant":
+            content = _fix_tool_call_json(content)
+            content = _fix_unclosed_tags(content)
 
         # Fix invalid emotions
         for bad, good in EMOTION_FIXES.items():
@@ -639,7 +715,7 @@ def call_llm(prompt: str, provider: str = "anthropic", model: str = None,
             },
             json={
                 "model": model or "claude-sonnet-4-20250514",
-                "max_tokens": 16000,
+                "max_tokens": 32000,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.9,
             },
@@ -661,7 +737,7 @@ def call_llm(prompt: str, provider: str = "anthropic", model: str = None,
             headers={"Authorization": f"Bearer {key}"},
             json={
                 "model": model or "gpt-4o",
-                "max_tokens": 16000,
+                "max_tokens": 32000,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.9,
             },
@@ -681,8 +757,40 @@ def call_llm(prompt: str, provider: str = "anthropic", model: str = None,
     raise ValueError(f"Unknown provider: {provider}")
 
 
+def _fix_json_string(text: str) -> str:
+    """Fix common LLM JSON issues: unescaped newlines, control chars, bad quotes."""
+    # Fix literal newlines inside JSON strings (invalid control characters)
+    # We need to be careful to only fix newlines INSIDE string values, not structural ones.
+    # Strategy: replace \n that appears between quotes with \\n
+    result = []
+    in_string = False
+    escape_next = False
+    for ch in text:
+        if escape_next:
+            result.append(ch)
+            escape_next = False
+            continue
+        if ch == '\\' and in_string:
+            result.append(ch)
+            escape_next = True
+            continue
+        if ch == '"' and not escape_next:
+            in_string = not in_string
+        if in_string and ch == '\n':
+            result.append('\\n')
+            continue
+        if in_string and ch == '\r':
+            result.append('\\r')
+            continue
+        if in_string and ch == '\t':
+            result.append('\\t')
+            continue
+        result.append(ch)
+    return ''.join(result)
+
+
 def extract_json_array(text: str) -> list:
-    """Extract a JSON array from LLM response."""
+    """Extract a JSON array from LLM response, with robust error recovery."""
     text = text.strip()
     if text.startswith("```"):
         first_nl = text.index("\n")
@@ -703,12 +811,52 @@ def extract_json_array(text: str) -> list:
     start = text.find("[")
     end = text.rfind("]") + 1
     if start >= 0 and end > start:
+        chunk = text[start:end]
         try:
-            return json.loads(text[start:end])
+            return json.loads(chunk)
         except json.JSONDecodeError:
             pass
 
-    raise ValueError(f"Could not extract JSON array from response")
+        # Fix common issues and retry
+        fixed = _fix_json_string(chunk)
+        try:
+            return json.loads(fixed)
+        except json.JSONDecodeError:
+            pass
+
+        # Last resort: parse turns individually with regex
+        turns = []
+        pattern = re.compile(
+            r'\{\s*"role"\s*:\s*"(user|assistant|system)"\s*,\s*"content"\s*:\s*"',
+            re.DOTALL,
+        )
+        for m in pattern.finditer(chunk):
+            role = m.group(1)
+            # Find the end of this content string — look for unescaped " followed by }
+            content_start = m.end()
+            pos = content_start
+            while pos < len(chunk):
+                if chunk[pos] == '\\':
+                    pos += 2  # skip escaped char
+                    continue
+                if chunk[pos] == '"':
+                    # Check if followed by whitespace/} to confirm end of string
+                    rest = chunk[pos + 1:pos + 20].lstrip()
+                    if rest.startswith('}'):
+                        content = chunk[content_start:pos]
+                        # Unescape JSON string escapes
+                        try:
+                            content = json.loads(f'"{content}"')
+                        except json.JSONDecodeError:
+                            content = content.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+                        turns.append({"role": role, "content": content})
+                        break
+                pos += 1
+
+        if len(turns) >= 4:
+            return turns
+
+    raise ValueError("Could not extract JSON array from response")
 
 
 # =============================================================================
@@ -798,6 +946,18 @@ def generate_hybrid_dataset(
 
             try:
                 response = call_llm(prompt, provider=provider, model=model, api_key=api_key)
+
+                # Always save raw response (tokens are expensive!)
+                raw_dir = os.path.join(os.path.dirname(output_path) or ".", "raw_responses")
+                os.makedirs(raw_dir, exist_ok=True)
+                with open(os.path.join(raw_dir, f"{sample_id}.txt"), "w", encoding="utf-8") as rf:
+                    rf.write(response)
+                with open(os.path.join(raw_dir, f"{sample_id}_meta.json"), "w") as rf:
+                    json.dump({"id": sample_id, "scenario": config["scenario"],
+                               "domain": config["domain"], "config": config,
+                               "provider": provider, "model": model or "default",
+                               "response_chars": len(response)}, rf, indent=2)
+
                 turns = extract_json_array(response)
 
                 # Post-process: merge consecutive assistant turns, fix emotions
