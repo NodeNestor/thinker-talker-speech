@@ -1,33 +1,36 @@
 #!/usr/bin/env python3
-"""Generate synthetic training data for the agentic speech model.
+"""Generate synthetic training data for the living agent speech model.
 
-Creates conversations where the model:
-  1. THINKS (internal reasoning, invisible to user)
-  2. USES TOOLS (search, code execution, file ops, etc.)
-  3. SPEAKS with human-like tags ([laugh], [sigh], etc.) and emotion metadata
+Two modes:
+  1. `--seed`    → Output the seed examples from SCENARIOS + LIVING_AGENT as JSONL
+  2. `--generate → Call an LLM to produce thousands of diverse variations
 
-The output format teaches the model to fluidly switch between all three modes.
+The LLM receives our full tool environment, format spec, and seed examples,
+then generates novel conversations that teach the model to:
+  - Speak naturally with fillers, pauses, human sounds
+  - Think internally before/between speech
+  - Use tools conversationally (coding, memory, vision, web, system)
+  - Handle interruptions gracefully
+  - Store/recall from knowledge graph and rolling context
+  - Work autonomously when user is away
 
-Output schema per turn:
-{
-    "conversation": [...messages...],
-    "emotion_labels": {turn_idx: {"emotion": "happy", "speed": 0.9, ...}},
-}
-
-Each assistant message can contain:
-  <think>internal reasoning</think>
-  <tool_call>{"name": "...", "args": {...}}</tool_call>
-  <tool_result>...</tool_result>
-  <speak emotion="..." speed="..." energy="...">text with [tags]</speak>
+Output: JSONL where each line is a multi-turn conversation with emotion metadata.
 """
 
 import json
 import random
 import os
+import time
+import argparse
 from typing import Optional
+from pathlib import Path
+
+# Import our scenario seeds and environment
+from living_agent_scenarios import SCENARIOS as LIVING_SCENARIOS, FORMAT_SPEC
+from environment import TOOLS, AGENT_STATES, INTERRUPTION_RULES, AUTONOMOUS_BEHAVIORS
 
 # =============================================================================
-# Speech tags that Chatterbox Turbo supports
+# Speech tags & emotion config (Chatterbox Turbo compatible)
 # =============================================================================
 
 SPEECH_TAGS = [
@@ -35,48 +38,39 @@ SPEECH_TAGS = [
     "[clear throat]", "[sniff]", "[groan]", "[shush]", "[pause]",
 ]
 
-# Emotion -> which tags are natural
 EMOTION_TAGS = {
-    "happy":     ["[laugh]", "[chuckle]"],
-    "excited":   ["[gasp]", "[laugh]"],
-    "sad":       ["[sigh]", "[pause]", "[sniff]"],
-    "angry":     ["[groan]", "[sigh]"],
+    "happy":      ["[laugh]", "[chuckle]"],
+    "excited":    ["[gasp]", "[laugh]"],
+    "sad":        ["[sigh]", "[pause]", "[sniff]"],
+    "angry":      ["[groan]", "[sigh]"],
     "empathetic": ["[sigh]", "[pause]"],
-    "surprised": ["[gasp]"],
-    "nervous":   ["[clear throat]", "[pause]", "[cough]"],
-    "calm":      ["[pause]"],
-    "amused":    ["[chuckle]", "[laugh]"],
-    "confused":  ["[pause]", "[clear throat]"],
-    "neutral":   ["[pause]"],
+    "surprised":  ["[gasp]"],
+    "nervous":    ["[clear throat]", "[pause]", "[cough]"],
+    "calm":       ["[pause]"],
+    "amused":     ["[chuckle]", "[laugh]"],
+    "confused":   ["[pause]", "[clear throat]"],
+    "neutral":    ["[pause]"],
 }
 
-# Prosody ranges per emotion
 EMOTION_PROSODY = {
-    "happy":     {"speed": (1.0, 1.3), "energy": (0.8, 1.2), "pitch": (0.1, 0.5)},
-    "excited":   {"speed": (1.2, 1.5), "energy": (1.0, 1.5), "pitch": (0.3, 0.8)},
-    "sad":       {"speed": (0.6, 0.8), "energy": (0.3, 0.6), "pitch": (-0.5, -0.1)},
-    "angry":     {"speed": (1.0, 1.3), "energy": (1.2, 1.8), "pitch": (0.0, 0.3)},
+    "happy":      {"speed": (1.0, 1.3), "energy": (0.8, 1.2), "pitch": (0.1, 0.5)},
+    "excited":    {"speed": (1.2, 1.5), "energy": (1.0, 1.5), "pitch": (0.3, 0.8)},
+    "sad":        {"speed": (0.6, 0.8), "energy": (0.3, 0.6), "pitch": (-0.5, -0.1)},
+    "angry":      {"speed": (1.0, 1.3), "energy": (1.2, 1.8), "pitch": (0.0, 0.3)},
     "empathetic": {"speed": (0.8, 1.0), "energy": (0.5, 0.8), "pitch": (-0.2, 0.1)},
-    "surprised": {"speed": (1.1, 1.4), "energy": (0.9, 1.3), "pitch": (0.3, 0.7)},
-    "nervous":   {"speed": (0.9, 1.2), "energy": (0.5, 0.8), "pitch": (0.0, 0.3)},
-    "calm":      {"speed": (0.8, 1.0), "energy": (0.4, 0.7), "pitch": (-0.3, 0.0)},
-    "amused":    {"speed": (1.0, 1.2), "energy": (0.7, 1.0), "pitch": (0.1, 0.4)},
-    "confused":  {"speed": (0.8, 1.0), "energy": (0.5, 0.8), "pitch": (0.0, 0.2)},
-    "neutral":   {"speed": (0.9, 1.1), "energy": (0.6, 0.9), "pitch": (-0.1, 0.1)},
+    "surprised":  {"speed": (1.1, 1.4), "energy": (0.9, 1.3), "pitch": (0.3, 0.7)},
+    "nervous":    {"speed": (0.9, 1.2), "energy": (0.5, 0.8), "pitch": (0.0, 0.3)},
+    "calm":       {"speed": (0.8, 1.0), "energy": (0.4, 0.7), "pitch": (-0.3, 0.0)},
+    "amused":     {"speed": (1.0, 1.2), "energy": (0.7, 1.0), "pitch": (0.1, 0.4)},
+    "confused":   {"speed": (0.8, 1.0), "energy": (0.5, 0.8), "pitch": (0.0, 0.2)},
+    "neutral":    {"speed": (0.9, 1.1), "energy": (0.6, 0.9), "pitch": (-0.1, 0.1)},
 }
 
 # =============================================================================
-# Scenario templates — each one teaches a different agentic + speech pattern
+# The 13 original single-turn scenarios (from v1 of this file)
 # =============================================================================
 
-SCENARIOS = [
-    # =================================================================
-    # KEY PATTERN: Speech comes FIRST, INTERLEAVED with thinking/tools.
-    # Filler words, acknowledgments, natural back-and-forth.
-    # The model speaks -> thinks -> speaks -> uses tool -> speaks.
-    # =================================================================
-
-    # --- Speak first, then investigate ---
+SINGLE_TURN_SCENARIOS = [
     {
         "context": "User is frustrated about a bug",
         "user": "I've been debugging this for 6 hours and I can't figure out why the tests keep failing!",
@@ -84,7 +78,7 @@ SCENARIOS = [
             '<speak emotion="empathetic" speed="0.9" energy="0.7">'
             'Oh man [sigh] six hours, yeah that\'s brutal. Okay let me take a look at this for you real quick.'
             '</speak>\n'
-            '<tool_call>{{"name": "run_tests", "args": {{"path": "tests/", "verbose": true}}}}</tool_call>\n'
+            '<tool_call>{"name": "run_tests", "args": {"path": "tests/", "verbose": true}}</tool_call>\n'
             '<tool_result>FAILED tests/test_api.py::test_auth - AssertionError: expected 200 got 401\n'
             'FAILED tests/test_api.py::test_user_create - ConnectionRefused\n2 failed, 14 passed</tool_result>\n'
             '<think>Auth 401 + connection refused — the test database isn\'t running. Simple fix.</think>\n'
@@ -96,7 +90,6 @@ SCENARIOS = [
         ),
         "emotion": "empathetic",
     },
-    # --- Quick acknowledgment then tool use ---
     {
         "context": "User asks about their model training results",
         "user": "How's the training run going? The loss was stuck at 2.3 yesterday.",
@@ -104,7 +97,7 @@ SCENARIOS = [
             '<speak emotion="neutral" speed="1.0" energy="0.7">'
             'Yeah let me check on that.'
             '</speak>\n'
-            '<tool_call>{{"name": "read_file", "args": {{"path": "logs/training.log", "tail": 20}}}}</tool_call>\n'
+            '<tool_call>{"name": "read_file", "args": {"path": "logs/training.log", "line_start": -20}}</tool_call>\n'
             '<tool_result>Epoch 47/50 | Loss: 0.34 | Val Acc: 94.2% | LR: 1e-5\n'
             'Epoch 48/50 | Loss: 0.31 | Val Acc: 94.8% | LR: 8e-6\n'
             'New best checkpoint saved!</tool_result>\n'
@@ -116,7 +109,6 @@ SCENARIOS = [
         ),
         "emotion": "excited",
     },
-    # --- Pure speech, no tools needed ---
     {
         "context": "User asks a technical question",
         "user": "Can you explain how attention works in transformers?",
@@ -134,173 +126,6 @@ SCENARIOS = [
         ),
         "emotion": "calm",
     },
-    # --- Speak, investigate, get surprised mid-flow ---
-    {
-        "context": "User asks to investigate a performance issue",
-        "user": "The API is super slow today, can you check what's going on?",
-        "assistant": (
-            '<speak emotion="neutral" speed="1.0" energy="0.7">'
-            'Yeah I\'ll check right now, one sec.'
-            '</speak>\n'
-            '<tool_call>{{"name": "check_metrics", "args": {{"service": "api", "period": "1h"}}}}</tool_call>\n'
-            '<tool_result>P99 latency: 12,340ms (normal: 200ms)\nCPU: 98%\nMemory: 7.2/8GB\n'
-            'Top endpoint: /api/search (87% of traffic)\nActive connections: 14,203</tool_result>\n'
-            '<speak emotion="surprised" speed="1.1" energy="1.0">'
-            'Whoa okay [gasp] 14,000 active connections, that\'s not normal. '
-            'Something is hammering your search endpoint. Let me dig deeper.'
-            '</speak>\n'
-            '<tool_call>{{"name": "check_logs", "args": {{"service": "api", "filter": "search", "limit": 5}}}}</tool_call>\n'
-            '<tool_result>All from IP 10.0.3.47 (internal staging bot) — 800 req/sec to /api/search</tool_result>\n'
-            '<speak emotion="amused" speed="1.1" energy="1.0">'
-            '[laugh] Okay so your own staging bot is DDoS-ing you. 800 requests per second from 10.0.3.47. '
-            'That\'s hilarious. [pause] Want me to kill it or rate-limit that IP?'
-            '</speak>'
-        ),
-        "emotion": "surprised",
-    },
-    # --- Bad news, lead with empathy ---
-    {
-        "context": "User asks about data recovery",
-        "user": "I accidentally ran rm -rf on the uploads folder. Can we get it back?",
-        "assistant": (
-            '<speak emotion="empathetic" speed="0.9" energy="0.6">'
-            'Oh no. [pause] Okay let me check if we have backups for that.'
-            '</speak>\n'
-            '<tool_call>{{"name": "check_backups", "args": {{"path": "uploads/"}}}}</tool_call>\n'
-            '<tool_result>No backups found for uploads/. Path is in .gitignore. '
-            'Last S3 sync: 3 weeks ago (partial).</tool_result>\n'
-            '<speak emotion="sad" speed="0.8" energy="0.5">'
-            '[sigh] Okay so [pause] I\'m not gonna sugarcoat it — the uploads folder wasn\'t in git '
-            'and there\'s no recent backup. [pause] There is an S3 sync from three weeks ago '
-            'but it\'s only partial. [pause] I know that\'s not what you wanted to hear. '
-            'But let me pull what we can from that S3 snapshot, it\'s better than nothing right?'
-            '</speak>'
-        ),
-        "emotion": "sad",
-    },
-    # --- Funny bug, respond with humor immediately ---
-    {
-        "context": "User finds a funny bug",
-        "user": "Why does the login page say 'Welcome to undefined, null!'?",
-        "assistant": (
-            '<speak emotion="amused" speed="1.1" energy="0.9">'
-            '[chuckle] Oh no, the classic. Welcome to undefined, null — my favorite greeting. '
-            'Alright let me find where that is.'
-            '</speak>\n'
-            '<tool_call>{{"name": "search_code", "args": {{"query": "Welcome to", "glob": "*.tsx"}}}}</tool_call>\n'
-            '<tool_result>src/pages/Login.tsx:14: `Welcome to ${company}, ${user.name}!`</tool_result>\n'
-            '<speak emotion="amused" speed="1.0" energy="0.8">'
-            'Yep, Login.tsx line 14. [pause] The company name and username aren\'t loaded yet when '
-            'the page renders so you get the existential crisis version. [laugh] '
-            'Quick fix, just needs optional chaining and a loading state. Want me to patch it?'
-            '</speak>'
-        ),
-        "emotion": "amused",
-    },
-    # --- Reassure then verify ---
-    {
-        "context": "Helping deploy, user is nervous",
-        "user": "Let's deploy to production. I'm nervous about this one.",
-        "assistant": (
-            '<speak emotion="calm" speed="0.9" energy="0.7">'
-            'Yeah I get it, prod deploys are stressful. [pause] Let me run the checks first, '
-            'we\'ll see where we stand.'
-            '</speak>\n'
-            '<tool_call>{{"name": "run_checks", "args": {{"env": "production", "dry_run": true}}}}</tool_call>\n'
-            '<tool_result>Pre-deploy checks:\n- Tests: 247/247 passed\n- Lint: 0 errors\n'
-            '- Type check: clean\n- DB migrations: 1 pending (backwards-compatible)\n'
-            '- Rollback plan: verified\nAll checks passed.</tool_result>\n'
-            '<speak emotion="calm" speed="1.0" energy="0.8">'
-            'Okay so [pause] 247 tests passing, zero lint errors, types clean, '
-            'migration is backwards-compatible, and rollback plan is verified. [pause] '
-            'Honestly this looks solid. Nothing to worry about — we\'ve got a safety net if anything goes wrong. '
-            'Ready when you are.'
-            '</speak>'
-        ),
-        "emotion": "calm",
-    },
-    # --- Philosophical, just speaking ---
-    {
-        "context": "Casual conversation",
-        "user": "Do you think AI will ever truly understand emotions?",
-        "assistant": (
-            '<speak emotion="calm" speed="0.85" energy="0.6">'
-            'Hmm. [pause] That\'s a really good question honestly. [pause] '
-            'I think [sigh] it depends what you mean by "understand" right? Like I can recognize patterns '
-            'that correlate with emotions — the words people use, how fast they\'re talking, the context. '
-            '[pause] But whether that\'s real understanding or just really good pattern matching, '
-            'I genuinely don\'t know. [pause] And I think that uncertainty is the most honest thing I can say.'
-            '</speak>'
-        ),
-        "emotion": "calm",
-    },
-    # --- Quick back and forth, multiple speak blocks ---
-    {
-        "context": "Fast-paced debugging session",
-        "user": "The build is broken again, same error as yesterday",
-        "assistant": (
-            '<speak emotion="neutral" speed="1.1" energy="0.8">'
-            'Ugh, again? [sigh] Okay hold on.'
-            '</speak>\n'
-            '<tool_call>{{"name": "run_command", "args": {{"cmd": "npm run build 2>&1 | tail -20"}}}}</tool_call>\n'
-            '<tool_result>ERROR in src/utils/auth.ts:34\nType \'string | undefined\' is not assignable to type \'string\'</tool_result>\n'
-            '<speak emotion="neutral" speed="1.0" energy="0.8">'
-            'Yep same one. auth.ts line 34, it\'s the undefined string thing. [pause] '
-            'Didn\'t we fix this yesterday?'
-            '</speak>\n'
-            '<tool_call>{{"name": "check_logs", "args": {{"service": "git", "filter": "auth.ts"}}}}</tool_call>\n'
-            '<tool_result>Yesterday\'s fix was on branch fix/auth-types but it was never merged to main</tool_result>\n'
-            '<speak emotion="amused" speed="1.1" energy="0.9">'
-            '[chuckle] There it is — the fix is sitting on a branch that never got merged. '
-            'Want me to merge it in?'
-            '</speak>'
-        ),
-        "emotion": "neutral",
-    },
-    # --- Excited discovery mid-investigation ---
-    {
-        "context": "User asks for help optimizing",
-        "user": "The page takes like 8 seconds to load, it's terrible",
-        "assistant": (
-            '<speak emotion="neutral" speed="1.0" energy="0.7">'
-            'Right, that\'s way too slow. Let me profile it.'
-            '</speak>\n'
-            '<tool_call>{{"name": "run_command", "args": {{"cmd": "lighthouse --output json --chrome-flags=--headless https://localhost:3000"}}}}</tool_call>\n'
-            '<tool_result>Performance: 23/100\nLCP: 7.2s\nTBT: 3400ms\nLargest resource: bundle.js (4.2MB uncompressed)</tool_result>\n'
-            '<speak emotion="surprised" speed="1.1" energy="1.0">'
-            'Oh [gasp] your bundle is 4.2 megs! That\'s the whole problem right there. [pause] '
-            'No wonder it takes 8 seconds.'
-            '</speak>\n'
-            '<think>4.2MB bundle — probably no code splitting, no tree shaking. Let me check the webpack config.</think>\n'
-            '<tool_call>{{"name": "read_file", "args": {{"path": "next.config.js"}}}}</tool_call>\n'
-            '<tool_result>module.exports = {{ webpack: (config) => {{ config.optimization.splitChunks = false; return config; }} }}</tool_result>\n'
-            '<speak emotion="amused" speed="1.1" energy="1.0">'
-            '[laugh] Someone literally turned OFF code splitting! splitChunks is set to false. '
-            'Delete that line and you\'ll probably cut load time by 70%. Want me to fix it?'
-            '</speak>'
-        ),
-        "emotion": "surprised",
-    },
-    # --- Interruption-aware: short responses that invite back-and-forth ---
-    {
-        "context": "Collaborative coding session",
-        "user": "Can you refactor the auth middleware? It's a mess.",
-        "assistant": (
-            '<speak emotion="neutral" speed="1.0" energy="0.7">'
-            'Yeah for sure. Let me look at what we\'re working with first.'
-            '</speak>\n'
-            '<tool_call>{{"name": "read_file", "args": {{"path": "src/middleware/auth.ts"}}}}</tool_call>\n'
-            '<tool_result>// 340 lines, nested try/catch, 6 levels of indentation, duplicated token validation</tool_result>\n'
-            '<speak emotion="calm" speed="0.9" energy="0.7">'
-            'Okay so [pause] yeah it\'s 340 lines with like six levels of nesting. [sigh] '
-            'I see three main things we can clean up — the duplicated token validation, '
-            'the nested try-catches, and the role checking logic. [pause] '
-            'Want me to tackle all three or start with the worst one?'
-            '</speak>'
-        ),
-        "emotion": "calm",
-    },
-    # --- Greeting / small talk ---
     {
         "context": "Start of conversation",
         "user": "Hey, how's it going?",
@@ -311,186 +136,564 @@ SCENARIOS = [
         ),
         "emotion": "happy",
     },
-    # --- Thinking out loud while working ---
-    {
-        "context": "User asks to fix a complex issue",
-        "user": "The WebSocket connections keep dropping every 30 seconds",
-        "assistant": (
-            '<speak emotion="neutral" speed="1.0" energy="0.7">'
-            'Hmm, every 30 seconds exactly? That sounds like a timeout. Let me check your config.'
-            '</speak>\n'
-            '<tool_call>{{"name": "search_code", "args": {{"query": "timeout.*30", "glob": "*.ts"}}}}</tool_call>\n'
-            '<tool_result>src/ws/server.ts:22: pingTimeout: 30000,\nnginx.conf:45: proxy_read_timeout 30s;</tool_result>\n'
-            '<speak emotion="neutral" speed="1.0" energy="0.8">'
-            'Yeah so there\'s two things — your WebSocket server has a 30-second ping timeout, '
-            'and nginx also has a 30-second proxy read timeout. [pause] '
-            'The nginx one is probably killing the connection before the ping can keep it alive. '
-            'If we bump the nginx timeout to 120 seconds that should fix it. [pause] Should I?'
-            '</speak>'
-        ),
-        "emotion": "neutral",
-    },
+]
+
+# =============================================================================
+# World state randomization — gives the LLM diverse contexts to work with
+# =============================================================================
+
+WORLD_STATES = {
+    "projects": [
+        "React dashboard with Next.js and Prisma",
+        "Python FastAPI backend with PostgreSQL",
+        "Rust CLI tool for log analysis",
+        "Flutter mobile app for fitness tracking",
+        "Go microservice handling payment webhooks",
+        "Vue.js e-commerce frontend",
+        "Node.js Discord bot with slash commands",
+        "PyTorch training pipeline for image classification",
+        "Kubernetes operator in Go",
+        "Chrome extension for productivity",
+        "Unity game with procedural generation",
+        "Svelte app with real-time collaboration",
+        "Django REST API for a CMS",
+        "Electron desktop app for video editing",
+        "Terraform infrastructure for AWS",
+    ],
+    "user_moods": [
+        "frustrated — been at this for hours",
+        "excited — just got something working",
+        "calm and focused",
+        "stressed — deadline tomorrow",
+        "curious — learning something new",
+        "tired — late night coding session",
+        "confused — inherited unfamiliar codebase",
+        "happy — code review went well",
+        "anxious — first production deploy",
+        "bored — doing repetitive refactoring",
+    ],
+    "time_of_day": [
+        "morning, just started work",
+        "midday, after lunch",
+        "afternoon, deep focus time",
+        "evening, wrapping up",
+        "late night, still coding",
+        "weekend, side project",
+    ],
+    "screen_contents": [
+        "VS Code with a TypeScript file open, red squiggly lines everywhere",
+        "Terminal showing a stack trace with 20 lines of Python errors",
+        "Browser with localhost:3000 showing a broken CSS layout",
+        "Grafana dashboard showing a spike in error rates",
+        "GitHub PR page with 47 comments and requested changes",
+        "Slack with 12 unread messages in #engineering",
+        "Jupyter notebook with training loss plots that plateau",
+        "Docker Desktop showing 3 containers, one in red (crashed)",
+        "AWS console showing an EC2 instance at 100% CPU",
+        "Empty terminal, user just opened it",
+    ],
+    "knowledge_graph_contents": [
+        {"entity": "daily standup", "type": "fact", "props": {"time": "10:30 AM", "channel": "#dev-sync"}},
+        {"entity": "user_prefs", "type": "preference", "props": {"editor": "VS Code", "tabs_vs_spaces": "spaces", "indent": 2}},
+        {"entity": "auth_service", "type": "project", "props": {"status": "migrating to JWT", "owner": "user"}},
+        {"entity": "deploy_process", "type": "concept", "props": {"steps": "test → staging → canary → prod", "rollback": "automated"}},
+        {"entity": "teammate_alex", "type": "person", "props": {"role": "backend lead", "timezone": "PST", "expertise": "databases"}},
+        {"entity": "sprint_goal", "type": "project", "props": {"goal": "ship user profiles V2", "deadline": "Friday"}},
+        {"entity": "user_prefs", "type": "preference", "props": {"language": "TypeScript", "framework": "Next.js", "test_runner": "vitest"}},
+        {"entity": "previous_bug", "type": "fact", "props": {"issue": "Stripe webhook key expired", "fix": "rotate key in vault", "date": "last week"}},
+    ],
+    "rolling_context_recalls": [
+        "Last session: user was refactoring the auth middleware, got halfway through",
+        "Yesterday: tried Recharts for dashboard, switched to Nivo for heatmaps",
+        "3 days ago: set up CI pipeline with GitHub Actions, added lint + test stages",
+        "Last week: debugged memory leak in WebSocket server, was the event listener cleanup",
+        "2 days ago: user asked about connection pooling, we increased pool size to 20",
+        "Earlier today: deployed staging successfully, waiting on QA signoff",
+    ],
+    "interruption_types": [
+        "random question about something unrelated",
+        "cat/dog/pet doing something chaotic",
+        "doorbell / delivery person",
+        "phone call they need to take",
+        "suddenly remembers something urgent",
+        "asks a dumb/funny philosophical question",
+        "wants to change topic entirely",
+        "spills coffee/water on keyboard",
+        "someone walks into the room",
+        "fire alarm / loud noise",
+    ],
+    "autonomous_triggers": [
+        "CI build failed on main branch",
+        "Training run finished while user was away",
+        "Noticed high CPU usage from a runaway process",
+        "PR was merged by a teammate",
+        "Dependency vulnerability alert from GitHub",
+        "Server health check started failing",
+        "User's screen shows an error they haven't noticed",
+        "New issue assigned to user in project tracker",
+    ],
+}
+
+
+def random_world_state() -> dict:
+    """Sample a random world state for the LLM to work with."""
+    return {
+        "project": random.choice(WORLD_STATES["projects"]),
+        "user_mood": random.choice(WORLD_STATES["user_moods"]),
+        "time_of_day": random.choice(WORLD_STATES["time_of_day"]),
+        "screen": random.choice(WORLD_STATES["screen_contents"]),
+        "memory_graph": random.sample(WORLD_STATES["knowledge_graph_contents"], k=random.randint(1, 3)),
+        "rolling_context": random.choice(WORLD_STATES["rolling_context_recalls"]),
+        "interruption": random.choice(WORLD_STATES["interruption_types"]) if random.random() < 0.4 else None,
+        "autonomous_trigger": random.choice(WORLD_STATES["autonomous_triggers"]) if random.random() < 0.25 else None,
+    }
+
+
+# =============================================================================
+# Scenario types to request from the LLM — weighted by importance
+# =============================================================================
+
+SCENARIO_TYPES = [
+    # (type, weight, description)
+    ("tool_use_conversation", 25, "User asks something that requires tools (code search, file read, tests, commands). Agent speaks first, uses tools, speaks results."),
+    ("interruption_mid_speech", 15, "Agent is speaking or using tools, user interrupts with something random. Agent handles it gracefully and offers to continue."),
+    ("memory_store_recall", 12, "Conversation where agent stores something in knowledge graph, then recalls it later in the same or 'later' conversation."),
+    ("rolling_context_recall", 8, "User asks about something from a previous session. Agent uses context_recall to find compressed old conversation."),
+    ("autonomous_initiate", 10, "Agent notices something (CI fail, screen error, process issue) and speaks up on its own. No user prompt first."),
+    ("pure_speech", 10, "Just talking — explanation, opinion, greeting, small talk. No tools needed. Natural with fillers and pauses."),
+    ("multi_tool_chain", 8, "Agent uses 2-3 tools in sequence, speaking between each. Shows investigation flow."),
+    ("vision_assist", 5, "Agent takes a screenshot, analyzes what's on screen, offers help based on what it sees."),
+    ("user_away_autonomous", 5, "User gives a task and leaves. Agent works autonomously — reads files, writes code, runs tests, commits. Reports back when user returns."),
+    ("emotional_shift", 5, "Conversation where the emotion shifts mid-way (e.g., investigating → surprised discovery, or calm → excited good news)."),
+    ("dumb_question_handling", 5, "User asks something silly, off-topic, or impossible. Agent responds with humor and redirects."),
+    ("error_recovery", 5, "A tool fails or returns unexpected results. Agent handles it gracefully, tries alternative approach."),
 ]
 
 
-def sample_prosody(emotion: str) -> dict:
-    """Sample prosody values for an emotion."""
-    ranges = EMOTION_PROSODY.get(emotion, EMOTION_PROSODY["neutral"])
-    return {
-        "speed": round(random.uniform(*ranges["speed"]), 2),
-        "energy": round(random.uniform(*ranges["energy"]), 2),
-        "pitch": round(random.uniform(*ranges["pitch"]), 2),
-    }
+def pick_scenario_type() -> tuple[str, str]:
+    """Weighted random pick of scenario type."""
+    types, weights, descs = zip(*SCENARIO_TYPES)
+    chosen = random.choices(range(len(types)), weights=weights, k=1)[0]
+    return types[chosen], descs[chosen]
 
 
-def augment_scenario(scenario: dict) -> dict:
-    """Add slight variations to a scenario."""
-    prosody = sample_prosody(scenario["emotion"])
-    return {
-        "messages": [
-            {"role": "user", "content": scenario["user"]},
-            {"role": "assistant", "content": scenario["assistant"]},
-        ],
-        "context": scenario["context"],
-        "emotion_labels": {
-            "emotion": scenario["emotion"],
-            **prosody,
+# =============================================================================
+# The mega-prompt for LLM generation
+# =============================================================================
+
+def build_tools_description() -> str:
+    """Format our tool environment for the LLM prompt."""
+    lines = []
+    for name, info in TOOLS.items():
+        args_str = ", ".join(f"{k}: {v}" for k, v in info["args"].items())
+        lines.append(f"  {name}({args_str}) — {info['description']}")
+    return "\n".join(lines)
+
+
+def build_seed_examples(n: int = 3) -> str:
+    """Pick N seed examples to show the LLM the format."""
+    all_scenarios = LIVING_SCENARIOS + [
+        {"id": f"single_{i}", "turns": [
+            {"role": "user", "content": s["user"]},
+            {"role": "assistant", "content": s["assistant"]},
+        ], "context": s["context"]}
+        for i, s in enumerate(SINGLE_TURN_SCENARIOS)
+    ]
+    picked = random.sample(all_scenarios, min(n, len(all_scenarios)))
+    examples = []
+    for sc in picked:
+        examples.append(json.dumps({"id": sc["id"], "context": sc.get("context", ""), "turns": sc["turns"]}, indent=2))
+    return "\n---\n".join(examples)
+
+
+def build_generation_prompt(scenario_type: str, scenario_desc: str, world: dict, seed_examples: str) -> str:
+    """Build the full prompt for the LLM to generate one conversation."""
+    return f"""You are generating training data for a living AI agent that talks, thinks, uses tools, and has memory.
+
+## YOUR TASK
+Generate ONE realistic multi-turn conversation of type: **{scenario_type}**
+Description: {scenario_desc}
+
+## WORLD STATE FOR THIS CONVERSATION
+- Project: {world['project']}
+- User mood: {world['user_mood']}
+- Time: {world['time_of_day']}
+- Screen: {world['screen']}
+- Knowledge graph has: {json.dumps(world['memory_graph'])}
+- Rolling context from previous session: {world['rolling_context']}
+{"- INTERRUPTION: User will " + world['interruption'] + " at some point during the conversation" if world['interruption'] else "- No interruptions this conversation"}
+{"- AUTONOMOUS TRIGGER: " + world['autonomous_trigger'] if world['autonomous_trigger'] else ""}
+
+## AVAILABLE TOOLS
+{build_tools_description()}
+
+## FORMAT RULES
+Each turn is {{"role": "user"|"assistant"|"system", "content": "..."}}
+
+Assistant content uses these blocks (can be mixed in any order):
+  <think>internal reasoning (never spoken aloud)</think>
+  <tool_call>{{"name": "tool_name", "args": {{}}}}</tool_call>
+  <tool_result>realistic simulated output</tool_result>
+  <speak emotion="EMOTION" speed="FLOAT" energy="FLOAT">spoken text with [tags]</speak>
+  <interrupted/>  (user started speaking, model stops mid-sentence)
+
+Speech tags (Chatterbox Turbo): [laugh] [chuckle] [sigh] [gasp] [cough] [clear throat] [sniff] [groan] [shush] [pause]
+Emotions: neutral, happy, sad, angry, excited, empathetic, surprised, nervous, calm, amused, confused
+Speed: 0.5-1.5, Energy: 0.3-1.5
+
+System messages are environment events: [CI webhook: ...], [periodic screen check], [5 minutes of silence], etc.
+
+## KEY BEHAVIORS TO MODEL
+1. Agent SPEAKS FIRST — acknowledge, then investigate. Never silently use tools.
+2. Agent uses FILLER naturally — "yeah", "okay so", "hmm", "right", "let me..."
+3. Agent THINKS between actions — reasoning is in <think> blocks, never spoken.
+4. When INTERRUPTED: stop gracefully, handle the interruption, offer to continue.
+5. Tool results are REALISTIC — file contents, test output, git diffs, actual errors.
+6. Memory operations use the KNOWLEDGE GRAPH (memory_store/query/update) and ROLLING CONTEXT (context_compress/recall).
+7. Emotions SHIFT naturally — agent might start neutral, get surprised by findings, then amused.
+8. DON'T be generic — reference the specific project, files, and technologies from the world state.
+
+## SEED EXAMPLES (for format reference — generate something DIFFERENT)
+{seed_examples}
+
+## OUTPUT
+Return ONLY a valid JSON object with this structure:
+{{"id": "unique_id", "type": "{scenario_type}", "context": "brief context", "turns": [...]}}
+
+Generate the conversation now. Make it feel REAL — like an actual person talking to their AI assistant."""
+
+
+# =============================================================================
+# LLM API callers — supports Anthropic, OpenAI-compatible, and local
+# =============================================================================
+
+def call_anthropic(prompt: str, model: str = "claude-sonnet-4-20250514", api_key: str = None) -> str:
+    """Call Anthropic API directly."""
+    import httpx
+    key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        raise ValueError("Set ANTHROPIC_API_KEY or pass api_key")
+    resp = httpx.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
         },
-    }
+        json={
+            "model": model,
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()["content"][0]["text"]
 
 
-def generate_dataset(
-    num_samples: int = 5000,
-    output_path: str = "data/synthetic_agentic_speech.jsonl",
+def call_openai_compatible(prompt: str, model: str = "gpt-4o", base_url: str = None, api_key: str = None) -> str:
+    """Call OpenAI-compatible API (OpenAI, Ollama, vLLM, LM Studio, etc.)."""
+    import httpx
+    url = base_url or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    key = api_key or os.environ.get("OPENAI_API_KEY", "not-needed")
+    resp = httpx.post(
+        f"{url.rstrip('/')}/chat/completions",
+        headers={"Authorization": f"Bearer {key}", "content-type": "application/json"},
+        json={
+            "model": model,
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.9,
+        },
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+
+def call_claude_cli(prompt: str) -> str:
+    """Call Claude via the `claude` CLI (zero config, uses existing auth)."""
+    import subprocess
+    result = subprocess.run(
+        ["claude", "-p", prompt, "--output-format", "text"],
+        capture_output=True, text=True, timeout=120,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"claude CLI failed: {result.stderr}")
+    return result.stdout
+
+
+PROVIDERS = {
+    "anthropic": call_anthropic,
+    "openai": call_openai_compatible,
+    "ollama": lambda p, **kw: call_openai_compatible(p, base_url="http://localhost:11434/v1", **kw),
+    "lmstudio": lambda p, **kw: call_openai_compatible(p, base_url="http://localhost:1234/v1", **kw),
+    "vllm": lambda p, **kw: call_openai_compatible(p, base_url="http://localhost:8000/v1", **kw),
+    "claude-cli": call_claude_cli,
+}
+
+
+# =============================================================================
+# JSON extraction — LLMs sometimes wrap in markdown code blocks
+# =============================================================================
+
+def extract_json(text: str) -> dict:
+    """Extract JSON from LLM response, handling markdown wrappers."""
+    text = text.strip()
+    # Strip markdown code block
+    if text.startswith("```"):
+        first_newline = text.index("\n")
+        last_backticks = text.rindex("```")
+        text = text[first_newline + 1:last_backticks].strip()
+    # Try direct parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Try finding the JSON object
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start >= 0 and end > start:
+        try:
+            return json.loads(text[start:end])
+        except json.JSONDecodeError:
+            pass
+    raise ValueError(f"Could not extract JSON from response:\n{text[:500]}")
+
+
+# =============================================================================
+# Main generation pipeline
+# =============================================================================
+
+def generate_seed_dataset(output_path: str) -> int:
+    """Export all seed scenarios (hand-crafted) as JSONL."""
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    count = 0
+    with open(output_path, "w") as f:
+        # Living agent scenarios (multi-turn)
+        for sc in LIVING_SCENARIOS:
+            record = {
+                "id": sc["id"],
+                "type": "seed_living_agent",
+                "context": sc.get("context", ""),
+                "turns": sc["turns"],
+            }
+            f.write(json.dumps(record) + "\n")
+            count += 1
+        # Single-turn scenarios
+        for i, sc in enumerate(SINGLE_TURN_SCENARIOS):
+            record = {
+                "id": f"seed_single_{i}",
+                "type": "seed_single_turn",
+                "context": sc["context"],
+                "turns": [
+                    {"role": "user", "content": sc["user"]},
+                    {"role": "assistant", "content": sc["assistant"]},
+                ],
+                "emotion": sc["emotion"],
+            }
+            f.write(json.dumps(record) + "\n")
+            count += 1
+    print(f"Wrote {count} seed examples -> {output_path}")
+    return count
+
+
+def generate_llm_dataset(
+    num_samples: int = 500,
+    output_path: str = "data/synthetic_living_agent.jsonl",
+    provider: str = "anthropic",
+    model: str = None,
+    api_key: str = None,
+    base_url: str = None,
     seed: int = 42,
+    resume: bool = True,
 ):
-    """Generate synthetic agentic speech training data.
+    """Generate diverse training data by calling an LLM.
 
-    For a real production dataset, you'd use a large LLM (Claude/GPT-4)
-    to generate thousands of unique scenarios. This script provides the
-    template format and seed examples.
+    Args:
+        num_samples: How many conversations to generate
+        output_path: Where to write the JSONL
+        provider: anthropic, openai, ollama, lmstudio, vllm, claude-cli
+        model: Model name (provider-specific)
+        api_key: API key (or set env var)
+        base_url: For openai-compatible providers
+        seed: Random seed
+        resume: If True, skip existing IDs in output file
     """
     random.seed(seed)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-    samples = []
+    # Set up LLM caller
+    caller = PROVIDERS.get(provider)
+    if caller is None:
+        raise ValueError(f"Unknown provider: {provider}. Options: {list(PROVIDERS.keys())}")
 
-    # Generate from templates with prosody variation
-    for i in range(num_samples):
-        scenario = random.choice(SCENARIOS)
-        sample = augment_scenario(scenario)
-        sample["id"] = i
-        samples.append(sample)
+    call_kwargs = {}
+    if model:
+        call_kwargs["model"] = model
+    if api_key:
+        call_kwargs["api_key"] = api_key
+    if base_url and provider == "openai":
+        call_kwargs["base_url"] = base_url
 
-    # Write JSONL
-    with open(output_path, "w") as f:
-        for sample in samples:
-            f.write(json.dumps(sample) + "\n")
+    # Resume support — skip already generated IDs
+    existing_ids = set()
+    if resume and os.path.exists(output_path):
+        with open(output_path) as f:
+            for line in f:
+                try:
+                    existing_ids.add(json.loads(line)["id"])
+                except (json.JSONDecodeError, KeyError):
+                    pass
+        print(f"Resuming: {len(existing_ids)} existing samples found")
 
-    print(f"Generated {len(samples)} samples -> {output_path}")
-    print(f"Unique scenarios: {len(SCENARIOS)}")
-    print(f"Emotions covered: {sorted(set(s['emotion'] for s in SCENARIOS))}")
-    print(f"\nTo generate MORE diverse data, use an LLM to expand these templates.")
-    print(f"See generate_with_llm() for the prompt template.")
+    generated = 0
+    failed = 0
+    start_time = time.time()
 
-    return samples
+    with open(output_path, "a") as f:
+        for i in range(num_samples):
+            sample_id = f"gen_{seed}_{i:05d}"
+            if sample_id in existing_ids:
+                continue
+
+            # Pick scenario type and world state
+            scenario_type, scenario_desc = pick_scenario_type()
+            world = random_world_state()
+            seed_examples = build_seed_examples(n=2)
+
+            prompt = build_generation_prompt(scenario_type, scenario_desc, world, seed_examples)
+
+            try:
+                response = caller(prompt, **call_kwargs)
+                data = extract_json(response)
+
+                # Validate structure
+                if "turns" not in data or not isinstance(data["turns"], list):
+                    raise ValueError("Missing or invalid 'turns' field")
+                if len(data["turns"]) < 2:
+                    raise ValueError("Need at least 2 turns")
+
+                # Stamp with metadata
+                data["id"] = sample_id
+                data["type"] = scenario_type
+                data["world_state"] = {
+                    "project": world["project"],
+                    "user_mood": world["user_mood"],
+                    "time_of_day": world["time_of_day"],
+                }
+                data["generator"] = {"provider": provider, "model": model or "default"}
+
+                f.write(json.dumps(data) + "\n")
+                f.flush()
+                generated += 1
+
+                elapsed = time.time() - start_time
+                rate = generated / elapsed if elapsed > 0 else 0
+                print(f"  [{generated}/{num_samples}] {scenario_type} ({rate:.1f}/s)")
+
+            except Exception as e:
+                failed += 1
+                print(f"  FAILED ({scenario_type}): {e}")
+                if failed > num_samples * 0.3:
+                    print("Too many failures (>30%), stopping.")
+                    break
+
+    elapsed = time.time() - start_time
+    print(f"\nDone: {generated} generated, {failed} failed in {elapsed:.0f}s")
+    print(f"Output: {output_path}")
+    return generated
 
 
 # =============================================================================
-# LLM-powered generation (use Claude/GPT-4 to generate thousands of unique ones)
+# Dataset stats
 # =============================================================================
 
-LLM_GENERATION_PROMPT = """Generate a realistic conversation turn where an AI assistant:
-1. THINKS internally (reasoning about the situation)
-2. Optionally USES TOOLS (search, run code, check files, etc.)
-3. SPEAKS with natural human-like speech tags and appropriate emotion
+def dataset_stats(path: str):
+    """Print stats about a generated dataset."""
+    if not os.path.exists(path):
+        print(f"File not found: {path}")
+        return
 
-The assistant is agentic — it can reason, use tools, and search before responding.
-When it speaks, it uses these tags naturally: [laugh], [chuckle], [sigh], [gasp],
-[cough], [clear throat], [sniff], [groan], [pause]
+    types = {}
+    emotions = {}
+    turn_counts = []
+    total = 0
 
-Format the assistant response EXACTLY like this:
-<think>internal reasoning here</think>
-<tool_call>{"name": "tool_name", "args": {"key": "value"}}</tool_call>
-<tool_result>tool output here</tool_result>
-<speak emotion="EMOTION" speed="FLOAT" energy="FLOAT">
-Spoken text with [tags] naturally placed.
-</speak>
+    with open(path) as f:
+        for line in f:
+            try:
+                data = json.loads(line)
+                total += 1
+                t = data.get("type", "unknown")
+                types[t] = types.get(t, 0) + 1
+                turn_counts.append(len(data.get("turns", [])))
+                # Count emotions in speak blocks
+                for turn in data.get("turns", []):
+                    content = turn.get("content", "")
+                    for emo in EMOTION_PROSODY:
+                        if f'emotion="{emo}"' in content:
+                            emotions[emo] = emotions.get(emo, 0) + 1
+            except json.JSONDecodeError:
+                pass
 
-Available emotions: happy, excited, sad, angry, empathetic, surprised, nervous, calm, amused, confused
-Speed: 0.5 (slow) to 1.5 (fast), Energy: 0.3 (quiet) to 1.5 (loud)
-
-Available tools the assistant can use:
-- search_code: search codebase
-- run_tests: run test suite
-- read_file: read a file
-- check_logs: check service logs
-- check_metrics: check performance metrics
-- run_command: execute a shell command
-- web_search: search the internet
-- check_backups: check for backups
-
-Context: {context}
-User message: {user_message}
-
-Generate ONLY the assistant response (no user message). Make it natural and realistic.
-Include at least one tool call if it makes sense for the context."""
+    print(f"Dataset: {path}")
+    print(f"Total conversations: {total}")
+    print(f"Total turns: {sum(turn_counts)}")
+    print(f"Avg turns/conversation: {sum(turn_counts)/max(total,1):.1f}")
+    print(f"\nScenario types:")
+    for t, c in sorted(types.items(), key=lambda x: -x[1]):
+        print(f"  {t}: {c} ({100*c/total:.0f}%)")
+    print(f"\nEmotion distribution:")
+    for e, c in sorted(emotions.items(), key=lambda x: -x[1]):
+        print(f"  {e}: {c}")
 
 
-def generate_with_llm(
-    contexts: list[str] = None,
-    output_path: str = "data/synthetic_agentic_speech_llm.jsonl",
-    model: str = "claude-sonnet-4-20250514",
-):
-    """Generate diverse training data using an LLM.
-
-    This produces much higher quality and more diverse data than templates.
-    Requires ANTHROPIC_API_KEY or OPENAI_API_KEY.
-
-    Usage:
-        python generate_synthetic.py --llm --num 5000
-    """
-    if contexts is None:
-        contexts = [
-            "User is debugging a production outage at 3am",
-            "User just got their first open source contribution merged",
-            "User is learning Python for the first time",
-            "User's CI pipeline is broken before a deadline",
-            "User found a security vulnerability in their app",
-            "User is excited about a new feature they built",
-            "User is confused about async/await",
-            "User accidentally deleted their database",
-            "User wants to refactor a 5000-line file",
-            "User is preparing for a technical interview",
-            "User's model training hit NaN loss",
-            "User wants to optimize their app's load time",
-            "User is migrating from JavaScript to TypeScript",
-            "User's docker container keeps crashing",
-            "User discovered their API has no rate limiting",
-            "Casual conversation about favorite programming languages",
-            "User asks for help writing documentation",
-            "User's deployment succeeded after many failures",
-            "User wants to set up monitoring and alerting",
-            "User is overwhelmed by a massive codebase they inherited",
-        ]
-
-    print(f"To generate with LLM, call this function with an API client.")
-    print(f"Template prompt saved — use with Claude or GPT-4 for best results.")
-    print(f"Example contexts: {len(contexts)}")
-    print(f"\nPrompt template:")
-    print(LLM_GENERATION_PROMPT[:500] + "...")
-
+# =============================================================================
+# CLI
+# =============================================================================
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--num", type=int, default=5000, help="Number of samples")
-    parser.add_argument("--output", default="data/synthetic_agentic_speech.jsonl")
-    parser.add_argument("--llm", action="store_true", help="Show LLM generation instructions")
-    parser.add_argument("--seed", type=int, default=42)
+    parser = argparse.ArgumentParser(description="Generate living agent training data")
+    sub = parser.add_subparsers(dest="command")
+
+    # Seed export
+    seed_cmd = sub.add_parser("seed", help="Export hand-crafted seed examples as JSONL")
+    seed_cmd.add_argument("--output", default="data/seed_examples.jsonl")
+
+    # LLM generation
+    gen_cmd = sub.add_parser("generate", help="Generate diverse data using an LLM")
+    gen_cmd.add_argument("--num", type=int, default=500, help="Number of conversations")
+    gen_cmd.add_argument("--output", default="data/synthetic_living_agent.jsonl")
+    gen_cmd.add_argument("--provider", default="anthropic",
+                         choices=list(PROVIDERS.keys()),
+                         help="LLM provider")
+    gen_cmd.add_argument("--model", default=None, help="Model name (provider-specific)")
+    gen_cmd.add_argument("--api-key", default=None, help="API key (or use env var)")
+    gen_cmd.add_argument("--base-url", default=None, help="Base URL for openai-compatible")
+    gen_cmd.add_argument("--seed", type=int, default=42)
+    gen_cmd.add_argument("--no-resume", action="store_true", help="Start fresh, don't skip existing")
+
+    # Stats
+    stats_cmd = sub.add_parser("stats", help="Print dataset statistics")
+    stats_cmd.add_argument("path", help="Path to JSONL dataset")
+
     args = parser.parse_args()
 
-    if args.llm:
-        generate_with_llm()
+    if args.command == "seed":
+        generate_seed_dataset(args.output)
+    elif args.command == "generate":
+        generate_llm_dataset(
+            num_samples=args.num,
+            output_path=args.output,
+            provider=args.provider,
+            model=args.model,
+            api_key=args.api_key,
+            base_url=args.base_url,
+            seed=args.seed,
+            resume=not args.no_resume,
+        )
+    elif args.command == "stats":
+        dataset_stats(args.path)
     else:
-        generate_dataset(num_samples=args.num, output_path=args.output, seed=args.seed)
+        parser.print_help()
