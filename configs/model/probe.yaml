@@ -1,0 +1,27 @@
+# Emotion/Prosody Probe Configuration
+
+deltanet_probe:
+  hidden_size: 1024
+  probe_hidden: 256
+  num_layers_to_probe: 6  # Read last 6 DeltaNet layers
+  emotions:
+    - neutral
+    - happy
+    - sad
+    - angry
+    - excited
+    - fearful
+    - surprised
+    - disgusted
+    - calm
+    - confused
+
+attention_probe:
+  hidden_size: 1024
+  probe_hidden: 128
+
+prosody_dims:
+  - speed       # 0.5-2.0
+  - pitch       # -1 to 1
+  - energy      # 0-2
+  - emphasis    # 0-1

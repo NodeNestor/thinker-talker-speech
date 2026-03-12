@@ -1,0 +1,42 @@
+# Stage 3: Train Emotion/Prosody Probe
+# Data: GoEmotions (text) + UltraVoice (speech+emotion+prosody) + MELD (dialogue)
+
+training:
+  batch_size: 32
+  learning_rate: 1.0e-3
+  weight_decay: 0.01
+  num_epochs: 10
+  warmup_steps: 500
+  scheduler: cosine
+
+data:
+  # Text emotion data (for DeltaNet probe on text)
+  text_emotion:
+    dataset: "google-research-datasets/go_emotions"
+    split: "train"
+    max_samples: 50000
+
+  # Speech emotion data (for probe on speech features)
+  speech_emotion:
+    dataset: "tutu0604/UltraVoice"
+    split: "train"
+    max_samples: 100000
+
+  # Dialogue emotion data (multi-turn context)
+  dialogue_emotion:
+    dataset: "ajyy/MELD_audio"
+    split: "train"
+    max_samples: 10000
+
+probe:
+  # Freeze the Thinker — only train the probe
+  freeze_thinker: true
+  deltanet_layers: "last_6"  # Which DeltaNet layers to read
+  attention_layers: "all"     # Which attention layers to read
+
+evaluation:
+  metrics:
+    - emotion_accuracy
+    - emotion_f1_macro
+    - prosody_mse
+  eval_every_n_steps: 500

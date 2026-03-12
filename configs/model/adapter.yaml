@@ -1,0 +1,6 @@
+whisper_model_id: "openai/whisper-small"
+freeze_encoder: true
+whisper_dim: 768
+thinker_hidden_size: 1024
+downsample_stride: 2
+output_rate_hz: 25
