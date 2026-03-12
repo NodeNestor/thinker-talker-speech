@@ -49,14 +49,19 @@ class Thinker(nn.Module):
             attn_implementation="eager",  # Need eager for hidden state hooks
         ).to(device)
 
-        # Apply LoRA
+        # Apply DoRA (LoRA with magnitude/direction decomposition — +3.7% over LoRA)
         if use_lora:
             lora_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
                 r=lora_rank,
                 lora_alpha=lora_alpha,
-                lora_dropout=0.05,
-                target_modules=["q_proj", "v_proj", "o_proj", "gate_proj", "up_proj"],
+                lora_dropout=0.0,  # 0 dropout with DoRA per NVIDIA recommendation
+                target_modules=[
+                    "q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj",
+                ],
+                use_dora=True,
+                bias="none",
             )
             self.model = get_peft_model(self.model, lora_config)
             self.model.print_trainable_parameters()
