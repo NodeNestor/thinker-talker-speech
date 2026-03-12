@@ -9,7 +9,8 @@ build/
 *.dylib
 
 # Data & models (large files)
-data/
+/data/
+!src/data/
 models/
 checkpoints/
 outputs/
