@@ -186,6 +186,33 @@ EMOTION_FIXES = {
     "helpful": "neutral",
     "patient": "calm",
     "encouraging": "happy",
+    "interested": "neutral",
+    "intrigued": "surprised",
+    "contemplative": "calm",
+    "nostalgic": "sad",
+    "dismissive": "neutral",
+    "supportive": "empathetic",
+    "teasing": "amused",
+    "dry": "neutral",
+    "upbeat": "happy",
+    "somber": "sad",
+    "defiant": "angry",
+    "sheepish": "nervous",
+    "resigned": "sad",
+    "earnest": "calm",
+    "amazed": "surprised",
+    "approving": "happy",
+    "casual": "neutral",
+    "emphatic": "excited",
+    "energetic": "excited",
+    "optimistic": "happy",
+    "realistic": "neutral",
+    "satisfied": "happy",
+    "shocked": "surprised",
+    "slightly_excited": "excited",
+    "uncertain": "nervous",
+    "understanding": "empathetic",
+    "very_happy": "happy",
 }
 
 
@@ -207,12 +234,149 @@ def _fix_unclosed_tags(content: str) -> str:
     return content
 
 
+def _track_braces(text: str, start: int) -> int:
+    """Track JSON brace depth from start, return index after closing brace or -1."""
+    brace_depth = 0
+    in_string = False
+    escape_next = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if escape_next:
+            escape_next = False
+            continue
+        if c == '\\' and in_string:
+            escape_next = True
+            continue
+        if c == '"' and not escape_next:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == '{':
+            brace_depth += 1
+        elif c == '}':
+            brace_depth -= 1
+            if brace_depth == 0:
+                return i + 1
+    return -1
+
+
+def _fix_tool_call_boundaries(content: str) -> str:
+    r"""Fix cases where LLM merged tool_call and tool_result into one block.
+
+    Common LLM failure patterns:
+      <tool_call>{"name":"screenshot","args":{}}</tool_result>   <- wrong close tag
+      <tool_call>{"name":"screenshot","args":{}}</tool_result>
+      <tool_result>Screenshot taken...</tool_result>             <- leaked into tool_call
+      <tool_call>{"name":"foo","args":{}}</tool_tool_call>       <- typo close tag
+
+    Fix: find <tool_call> followed by JSON, then truncate at the end of the JSON
+    object (first matching '}') and close with </tool_call>.
+    """
+    # Pattern: <tool_call> followed by JSON that ends with </tool_result> instead of </tool_call>
+    # or has no proper close tag at all
+    result = content
+
+    # Fix </tool_tool_call> typos
+    result = result.replace("</tool_tool_call>", "</tool_call>")
+
+    # Fix <tool_call>{...}</tool_result> — wrong close tag
+    # Find all <tool_call> positions and try to extract just the JSON object
+    parts = []
+    pos = 0
+    while pos < len(result):
+        tc_start = result.find("<tool_call>", pos)
+        if tc_start == -1:
+            parts.append(result[pos:])
+            break
+
+        parts.append(result[pos:tc_start])
+
+        json_start = tc_start + len("<tool_call>")
+
+        # First try brace tracking on original content
+        json_end = _track_braces(result, json_start)
+
+        if json_end == -1:
+            # Brace tracking failed. Try with newline-fixed version.
+            candidate = _fix_json_string(result[json_start:])
+            fixed_end = _track_braces(candidate, 0)
+            if fixed_end != -1:
+                json_str = candidate[:fixed_end]
+                # Find where to resume in original
+                orig_scan = result[json_start:]
+                next_tag = len(orig_scan)
+                for tag in ['<tool_result>', '</tool_result>', '<tool_call>',
+                            '</tool_call>', '<speak', '<think>', '</think>']:
+                    idx = orig_scan.find(tag)
+                    if idx > 0:
+                        next_tag = min(next_tag, idx)
+                json_end = json_start + next_tag
+            else:
+                # JSON is truncated (no closing braces at all).
+                # Find the end boundary and try to force-close the JSON.
+                orig_scan = result[json_start:]
+                next_tag = len(orig_scan)
+                for tag in ['<tool_result>', '</tool_result>', '<tool_call>',
+                            '</tool_call>', '<speak', '<think>', '</think>']:
+                    idx = orig_scan.find(tag)
+                    if idx > 0:
+                        next_tag = min(next_tag, idx)
+
+                truncated = _fix_json_string(orig_scan[:next_tag].rstrip())
+                # Try closing with increasing number of braces/quotes
+                for suffix in ['}', '"}', '"}}', '"}}}']:
+                    try:
+                        json.loads(truncated + suffix)
+                        json_str = truncated + suffix
+                        json_end = json_start + next_tag
+                        break
+                    except json.JSONDecodeError:
+                        # Also try with backslash fix
+                        fixed_t = re.sub(r'(?<!\\)\\(?![\\"/u])', r'\\\\', truncated)
+                        try:
+                            json.loads(fixed_t + suffix)
+                            json_str = fixed_t + suffix
+                            json_end = json_start + next_tag
+                            break
+                        except json.JSONDecodeError:
+                            continue
+                else:
+                    # Still can't parse. Extract name and make minimal tool_call.
+                    name_m = re.search(r'"name"\s*:\s*"([^"]+)"', truncated)
+                    if name_m:
+                        json_str = json.dumps({"name": name_m.group(1), "args": {}})
+                        json_end = json_start + next_tag
+                    else:
+                        parts.append(result[tc_start:tc_start + len("<tool_call>")])
+                        pos = json_start
+                        continue
+        else:
+            json_str = result[json_start:json_end]
+
+        parts.append(f"<tool_call>{json_str}</tool_call>")
+
+        # Skip past any wrong close tag that follows
+        after = result[json_end:].lstrip()
+        if after.startswith("</tool_call>"):
+            pos = json_end + result[json_end:].index("</tool_call>") + len("</tool_call>")
+        elif after.startswith("</tool_result>"):
+            pos = json_end + result[json_end:].index("</tool_result>") + len("</tool_result>")
+        elif after.startswith("</tool_tool_call>"):
+            pos = json_end + result[json_end:].index("</tool_tool_call>") + len("</tool_tool_call>")
+        else:
+            pos = json_end
+
+    return "".join(parts)
+
+
 def _fix_tool_call_json(content: str) -> str:
     r"""Fix common JSON issues in <tool_call> blocks.
 
-    LLMs often generate Windows paths with unescaped backslashes like:
-      C:\\Users\\foo  ->  valid JSON
-      C:\Users\foo   ->  INVALID (backslash-U is not a valid JSON escape)
+    Handles:
+    - Windows paths with unescaped backslashes (C:\Users\foo)
+    - Literal newlines in JSON string values (write_file content, type_text text)
+    - Args at wrong level ({"name":"foo", "path":"bar"} instead of {"name":"foo","args":{"path":"bar"}})
     """
     def _fix_json_block(m):
         raw = m.group(1)
@@ -220,13 +384,92 @@ def _fix_tool_call_json(content: str) -> str:
             json.loads(raw)
             return m.group(0)  # already valid
         except json.JSONDecodeError:
-            # Fix unescaped backslashes: replace single \ with \\ but not already-escaped \\
-            fixed = re.sub(r'(?<!\\)\\(?![\\"/bfnrtu])', r'\\\\', raw)
+            pass
+
+        fixed = raw
+
+        # Fix 1: Escape literal newlines/tabs inside JSON string values
+        fixed = _fix_json_string(fixed)
+
+        # Fix 2: Unescaped backslashes — in tool_call context, \b \f \n \r \t
+        # in file paths should be literal backslash+letter, not JSON escapes.
+        # Aggressively escape ALL single backslashes except \\ and \" and \/ and \uXXXX
+        fixed = re.sub(r'(?<!\\)\\(?![\\"/u])', r'\\\\', fixed)
+
+        try:
+            json.loads(fixed)
+            return f"<tool_call>{fixed}</tool_call>"
+        except json.JSONDecodeError:
+            pass
+
+        # Fix 3: Try to extract name and rebuild
+        name_m = re.search(r'"name"\s*:\s*"([^"]+)"', fixed)
+        if name_m:
+            tool_name = name_m.group(1)
+            # Try to find args object
+            args_m = re.search(r'"args"\s*:\s*(\{.*)', fixed, re.DOTALL)
+            if args_m:
+                # Find matching brace for args
+                args_raw = args_m.group(1)
+                depth = 0
+                for i, c in enumerate(args_raw):
+                    if c == '{':
+                        depth += 1
+                    elif c == '}':
+                        depth -= 1
+                        if depth == 0:
+                            args_str = args_raw[:i+1]
+                            try:
+                                args_obj = json.loads(args_str)
+                                rebuilt = json.dumps({"name": tool_name, "args": args_obj})
+                                return f"<tool_call>{rebuilt}</tool_call>"
+                            except json.JSONDecodeError:
+                                # Try fixing the args JSON too
+                                args_fixed = _fix_json_string(args_str)
+                                args_fixed = re.sub(r'(?<!\\)\\(?![\\"/u])', r'\\\\', args_fixed)
+                                try:
+                                    args_obj = json.loads(args_fixed)
+                                    rebuilt = json.dumps({"name": tool_name, "args": args_obj})
+                                    return f"<tool_call>{rebuilt}</tool_call>"
+                                except json.JSONDecodeError:
+                                    break
+
+            # Fix 4: Args at wrong level — {"name":"foo", "path":"bar", "content":"baz"}
+            # Rebuild as {"name":"foo", "args": {"path":"bar", "content":"baz"}}
             try:
-                json.loads(fixed)
-                return f"<tool_call>{fixed}</tool_call>"
-            except json.JSONDecodeError:
-                return m.group(0)  # give up, return original
+                # Try parsing with fixes applied to extract all keys
+                obj = None
+                try:
+                    obj = json.loads(fixed)
+                except json.JSONDecodeError:
+                    # Last resort: truncate at the point where JSON breaks
+                    # and try to close it
+                    for end_pos in range(len(fixed) - 1, 0, -1):
+                        if fixed[end_pos] == '"':
+                            attempt = fixed[:end_pos+1] + '}'
+                            if fixed.count('{') > 1:
+                                attempt += '}'
+                            try:
+                                obj = json.loads(attempt)
+                                break
+                            except json.JSONDecodeError:
+                                continue
+
+                if obj and isinstance(obj, dict) and "name" in obj:
+                    name = obj.pop("name")
+                    args = obj.pop("args", None)
+                    if args is None:
+                        args = obj  # remaining keys become args
+                    rebuilt = json.dumps({"name": name, "args": args})
+                    return f"<tool_call>{rebuilt}</tool_call>"
+            except Exception:
+                pass
+
+            # No args or args parsing failed — try minimal
+            minimal = json.dumps({"name": tool_name, "args": {}})
+            return f"<tool_call>{minimal}</tool_call>"
+
+        return m.group(0)  # give up, return original
 
     return re.sub(r"<tool_call>(.*?)</tool_call>", _fix_json_block, content, flags=re.DOTALL)
 
@@ -253,6 +496,7 @@ def postprocess_turns(turns: list[dict]) -> list[dict]:
 
         # Fix unclosed tags and broken JSON in assistant turns
         if turn.get("role") == "assistant":
+            content = _fix_tool_call_boundaries(content)
             content = _fix_tool_call_json(content)
             content = _fix_unclosed_tags(content)
 
@@ -700,29 +944,37 @@ def random_config() -> dict:
 # =============================================================================
 
 def call_llm(prompt: str, provider: str = "anthropic", model: str = None,
-             api_key: str = None) -> str:
-    """Call an LLM. Supports anthropic, openai, ollama, claude-cli."""
+             api_key: str = None, max_retries: int = 5) -> str:
+    """Call an LLM with retry on rate limits. Supports anthropic, openai, ollama, claude-cli."""
     import httpx
 
     if provider == "anthropic":
         key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-        resp = httpx.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": model or "claude-sonnet-4-20250514",
-                "max_tokens": 32000,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.9,
-            },
-            timeout=300,
-        )
-        resp.raise_for_status()
-        return resp.json()["content"][0]["text"]
+        for attempt in range(max_retries + 1):
+            resp = httpx.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": model or "claude-sonnet-4-20250514",
+                    "max_tokens": 32000,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.9,
+                },
+                timeout=300,
+            )
+            if resp.status_code == 429:
+                wait = min(2 ** attempt * 5, 120)  # 5s, 10s, 20s, 40s, 80s, 120s
+                print(f"    Rate limited, waiting {wait}s (attempt {attempt+1}/{max_retries})...")
+                import time as _time
+                _time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp.json()["content"][0]["text"]
+        resp.raise_for_status()  # raise the last 429
 
     elif provider in ("openai", "ollama", "lmstudio", "vllm"):
         urls = {
