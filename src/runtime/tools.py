@@ -93,8 +93,8 @@ class ToolExecutor:
         fpath.write_text(text, encoding="utf-8")
         return f"Edited: {path} (replaced 1 of {count} occurrences)"
 
-    def _search_code(self, query: str, glob: str = None, max_results: int = 20) -> str:
-        pattern = glob or "**/*"
+    def _search_code(self, query: str, glob: str = None, pattern: str = None, max_results: int = 20) -> str:
+        pattern = glob or pattern or "**/*"
         results = []
         for fpath in self.workspace.glob(pattern):
             if not fpath.is_file():

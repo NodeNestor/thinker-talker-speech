@@ -19,8 +19,12 @@ wandb/
 
 # Environment
 .env
-.venv/
+.venv*/
 venv/
+
+# Test/runtime output
+test_output/
+_agent_output.wav
 
 # IDE
 .vscode/
