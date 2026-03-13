@@ -1,3 +1,4 @@
+# Core
 torch>=2.4.0
 torchaudio>=2.4.0
 transformers>=4.46.0
@@ -5,20 +6,30 @@ datasets>=3.0.0
 accelerate>=1.0.0
 peft>=0.13.0
 safetensors>=0.4.0
+
+# Audio I/O & processing
 soundfile>=0.12.0
 librosa>=0.10.0
-einops>=0.8.0
-speechbrain>=1.0.0
 numpy>=1.26.0
 scipy>=1.12.0
-tqdm>=4.66.0
-wandb>=0.18.0
-hydra-core>=1.3.0
-omegaconf>=2.3.0
 
-# Training optimizations
-apollo-torch>=0.1.0
-cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git
-liger-kernel>=0.4.0
+# TTS (Talker)
+chatterbox-tts>=0.1.0
+
+# Speaker encoder
+speechbrain>=1.0.0
+
+# Thinker loading (LoRA + quantization)
+unsloth>=2024.12.0
 bitsandbytes>=0.44.0
-flash-attn>=2.6.0
+
+# Training utilities
+tqdm>=4.66.0
+einops>=0.8.0
+
+# Optional: logging
+# wandb>=0.18.0
+
+# Optional: training speed (WSL/Linux only)
+# flash-attn>=2.6.0
+# flash-linear-attention  # for DeltaNet acceleration

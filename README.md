@@ -148,13 +148,68 @@ The script auto-detects WSL and sets up a virtual environment with all dependenc
 | 4 | Synthetic (self-generated) | 600+ samples | Connector training |
 | 4 | LibriSpeech clean-100 | 100h | Connector training (fallback) |
 
+## Quick Start
+
+```bash
+# 1. Clone and install
+git clone https://github.com/user/thinker-talker-speech.git
+cd thinker-talker-speech
+pip install -r requirements.txt
+
+# 2. Download pre-trained components (Whisper, ECAPA-TDNN, Chatterbox)
+python scripts/download_models.py
+
+# 3. Download training data (LibriSpeech, GoEmotions)
+python scripts/download_data.py
+
+# 4. Run full training pipeline (picks GPU automatically)
+#    Set LORA_PATH to your Qwen 3.5 0.8B LoRA checkpoint
+LORA_PATH=checkpoints/living-agent/lora bash scripts/train_all_stages.sh
+```
+
+The training script runs all stages sequentially:
+1. Whisper Adapter alignment (~20 min on 16GB GPU)
+2. Emotion Probe training (~10 min)
+3. Synthetic data generation via Thinker + Chatterbox (~60 min for 600 samples)
+4. Connector training on synthetic data (~15 min)
+
+### Running Individual Stages
+
+```bash
+# Stage 1 only
+python -m src.training.train_stage1 --lora-path checkpoints/living-agent/lora
+
+# Stage 3 only
+python -m src.training.train_probe --lora-path checkpoints/living-agent/lora --epochs 15
+
+# Generate synthetic data only
+python -m src.training.generate_connector_data --lora-path checkpoints/living-agent/lora \
+    --output data/synthetic_connector --num-per-emotion 75
+
+# Stage 4 only (with synthetic data)
+python -m src.training.train_stage4 --synthetic-data data/synthetic_connector/manifest.json
+```
+
+### GPU Selection
+
+```bash
+# Use specific GPU (check nvidia-smi for indices)
+CUDA_VISIBLE_DEVICES=1 bash scripts/train_all_stages.sh
+
+# WSL recommended for Flash Attention support (2-3x faster)
+cd /mnt/e/Repos/thinker-talker-speech
+CUDA_VISIBLE_DEVICES=1 bash scripts/train_all_stages.sh
+```
+
 ## Requirements
 
 - NVIDIA GPU with >= 8GB VRAM (16GB recommended)
 - Python 3.10+
 - PyTorch 2.x with CUDA
-- Unsloth (for efficient Thinker loading)
-- Chatterbox TTS (`pip install chatterbox-tts`)
-- SpeechBrain (for ECAPA-TDNN speaker encoder)
+- See `requirements.txt` for full dependency list
 
-**Note**: On Windows, `torchaudio.save` requires TorchCodec which is unavailable. The pipeline uses `soundfile` for all audio I/O instead.
+### Platform Notes
+
+- **Windows**: `torchaudio.save` requires TorchCodec which is unavailable — the pipeline uses `soundfile` for all audio I/O instead
+- **WSL**: Recommended for training — supports Flash Attention and flash-linear-attention (DeltaNet acceleration)
+- **Chatterbox float32**: The pipeline patches Chatterbox's `norm_loudness` float64 promotion internally — no manual patching needed
