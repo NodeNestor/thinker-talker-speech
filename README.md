@@ -64,9 +64,10 @@ CUDA_VISIBLE_DEVICES=1 python scripts/live_agent.py --text --no-tts
 Features:
 - Always-on mic with VAD (voice activity detection)
 - User speech interrupts agent mid-sentence
-- Emotion-aware TTS (probe detects emotion, adjusts TTS temperature)
-- Streaming TTS with `--voice`: clause-level splitting + speech-token streaming (~0.3s first audio)
-- HiddenStateConnector: when trained, bypasses text decoding for richer speech (auto-detected)
+- **WhisperAdapter**: audio features fed directly to Thinker (preserves tone/prosody beyond text)
+- **Emotion Probe**: detects emotion from hidden states, adjusts TTS style
+- **Streaming TTS** with `--voice`: clause-level splitting + speech-token streaming (~0.3s first audio)
+- **HiddenStateConnector**: when trained, bypasses text decoding for richer speech (auto-detected)
 - Tool calling (file ops, git, web search, memory, timers)
 - Streaming token display (thinking in gray, speech in white)
 
@@ -100,15 +101,17 @@ python -m src.training.train_probe --lora-path checkpoints/living-agent/lora --e
 
 **Result**: 50.4% accuracy (10-class, soft labels)
 
-### Stage 4: StyleMapper (Optional)
+### Stage 4: HiddenStateConnector
 
-Trains a small network (~10K params) to learn emotion→style mapping from the probe's conditioning vector. Falls back to rule-based lookup tables if not trained.
+Trains the HiddenStateConnector (~2M params) to project Thinker hidden states directly into T3's text embedding space. This bypasses text decoding entirely — the Thinker's internal representation (which encodes emotion, emphasis, prosody) is projected straight into the TTS model's input space.
 
-The connector is **rule-based by default** — it maps emotion labels to Chatterbox params via lookup tables (e.g., "excited" → exaggeration=0.9, temperature=0.95). The StyleMapper learns to generalize beyond discrete labels.
+Uses FiLM conditioning from the emotion probe + cross-attention for sequence alignment between different tokenizers.
 
 ```bash
 python -m src.training.train_stage4 --lora-path checkpoints/living-agent/lora --probe-ckpt checkpoints/probe/probe_best.pt
 ```
+
+When trained, the connector activates automatically in `live_agent.py`. Falls back to text → T3 tokenizer path if checkpoint doesn't exist.
 
 ## Validation
 
@@ -160,13 +163,72 @@ CUDA_VISIBLE_DEVICES=1 bash scripts/train_all_stages.sh
 | 1 | LibriSpeech clean-100 | 100h | Whisper adapter alignment |
 | 2 | VoiceAssistant-400K | 400K pairs | Thinker LoRA finetuning |
 | 3 | GoEmotions | 58K texts | Emotion probe training |
-| 4 | GoEmotions + probe | reused | StyleMapper targets |
+| 4 | GoEmotions + probe | reused | HiddenStateConnector alignment |
+
+## Example Session
+
+```
+$ CUDA_VISIBLE_DEVICES=1 python scripts/live_agent.py --text --voice voice.wav
+
+Device: cuda
+  GPU: NVIDIA GeForce RTX 5060 Ti
+  VRAM: 16.0 GB
+
+Loading Thinker (Qwen 3.5 + LoRA via Unsloth)...
+  Loaded in 3.2s | LoRA layers: 168
+Loading Chatterbox Turbo (TTS)...
+  Loaded in 1.8s (sr=24000)
+  Streaming TTS enabled (voice: voice.wav)
+Loading WhisperAdapter...
+  Loaded in 0.4s (audio → Thinker embedding space)
+Loading Emotion Probe...
+  Loaded in 0.1s
+Loading HiddenStateConnector...
+  Loaded in 0.1s (direct hidden state → T3 path enabled)
+  Direct hidden state → speech path enabled
+
+VRAM used: 4.82 GB
+
+============================================================
+  Living Agent
+============================================================
+  Input:  keyboard
+  Output: text + voice
+  Think:  shown in gray
+  Tools:  shown in yellow
+  Quit:   say 'goodbye' or Ctrl+C
+============================================================
+
+You: Tell me something exciting!
+  [emotion: excited]
+  <think>The user wants excitement, let me share something fun...</think>
+  <speak emotion="excited">Oh you want excitement? Did you know that
+  octopuses have three hearts and blue blood? Nature is wild!</speak>
+  [excited] speaking: "Oh you want excitement? Did you know..."
+  [3.2s]
+```
+
+### Full Loop Test (TTS → STT → Thinker → TTS → STT)
+
+Validates the entire stack end-to-end — generates synthetic "user speech", transcribes it, feeds to Thinker, speaks the response, and verifies intelligibility:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python scripts/validate_stack.py --component loop --voice voice.wav
+```
+
+### Overlapped Streaming Benchmark
+
+Compare first-audio latency with and without pipelining:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python scripts/test_overlapped.py --compare --voice voice.wav
+```
 
 ## Quick Start
 
 ```bash
 # 1. Clone and install
-git clone https://github.com/user/thinker-talker-speech.git
+git clone https://github.com/NodeNestor/thinker-talker-speech.git
 cd thinker-talker-speech
 pip install -r requirements.txt
 
@@ -180,10 +242,10 @@ python scripts/download_data.py
 LORA_PATH=checkpoints/living-agent/lora bash scripts/train_all_stages.sh
 
 # 5. Validate everything works
-CUDA_VISIBLE_DEVICES=1 python scripts/validate_stack.py
+CUDA_VISIBLE_DEVICES=1 python scripts/validate_stack.py --voice data/reference_speakers/voice.wav
 
 # 6. Run the live agent
-CUDA_VISIBLE_DEVICES=1 python scripts/live_agent.py
+CUDA_VISIBLE_DEVICES=1 python scripts/live_agent.py --voice data/reference_speakers/voice.wav
 ```
 
 ## Requirements
