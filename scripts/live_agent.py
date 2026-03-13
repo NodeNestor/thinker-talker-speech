@@ -39,8 +39,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.runtime.runtime import parse_speak_attrs
 from src.runtime.tools import ToolExecutor
 from src.model.emotion_probe import EmotionProbe
-from src.model.connector import EMOTION_TEMPERATURE
+from src.model.connector import EMOTION_TEMPERATURE, HiddenStateConnector, ThinkerTalkerConnector
+from src.model.adapter import WhisperAdapter
 from src.training.train_probe import HiddenStateCapture
+from src.inference.streaming import StreamingTTSPipeline, find_clause_boundary
 
 log = logging.getLogger("live_agent")
 
@@ -109,6 +111,21 @@ def load_chatterbox(device: str = "cuda"):
     model = ChatterboxTurboTTS.from_pretrained(device=device)
     print(f"  Loaded in {time.time() - t0:.1f}s (sr={model.sr})")
     return model
+
+
+def load_adapter(ckpt_path: str, device: str = "cuda"):
+    """Load trained WhisperAdapter (Whisper encoder → Thinker embedding space)."""
+    print("Loading WhisperAdapter...")
+    t0 = time.time()
+    adapter = WhisperAdapter(thinker_hidden_size=1024, device=device)
+    state = torch.load(ckpt_path, map_location=device, weights_only=True)
+    # Load only the trainable params (downsample + proj), encoder is loaded fresh
+    adapter.load_state_dict(state, strict=False)
+    adapter = adapter.to(device).eval()
+    for p in adapter.parameters():
+        p.requires_grad = False
+    print(f"  Loaded in {time.time() - t0:.1f}s (audio → Thinker embedding space)")
+    return adapter
 
 
 # ── Audio I/O ───────────────────────────────────────────────────────
@@ -234,12 +251,30 @@ def transcribe(whisper_model, audio: np.ndarray, sr: int = 16000) -> str:
 # ── TTS Pipeline ────────────────────────────────────────────────────
 
 class TTSPipeline:
-    """Async TTS: generates next sentence while current one plays."""
+    """TTS with streaming audio generation and clause-level pipelining.
 
-    def __init__(self, tts_model, player: AudioPlayer):
+    Two modes:
+      1. Streaming (when voice_path set): Uses StreamingTTSPipeline for
+         speech-token-level audio chunks. Splits text into clauses first,
+         streams each clause's audio immediately. First audio in ~0.3s.
+      2. Basic (fallback): Sentence-level generation + pipelined playback.
+         Uses tts.generate() for each sentence. First audio in ~1s.
+    """
+
+    def __init__(self, tts_model, player: AudioPlayer, voice_path: str = None):
         self.tts = tts_model
         self.player = player
         self._interrupted = threading.Event()
+        self._stream_pipeline = None
+
+        if voice_path:
+            self._init_streaming(voice_path)
+
+    def _init_streaming(self, voice_path: str):
+        """Enable streaming TTS with speech-token-level audio chunks."""
+        self._stream_pipeline = StreamingTTSPipeline(self.tts)
+        self._stream_pipeline.set_voice(voice_path)
+        print(f"  Streaming TTS enabled (voice: {voice_path})")
 
     def _generate_audio(self, text: str, temperature: float = 0.8) -> np.ndarray:
         clean = re.sub(r'<(?!/?(?:laugh|chuckle|pause|sigh|gasp))[^>]+>', '', text).strip()
@@ -250,10 +285,44 @@ class TTSPipeline:
         return audio[0] if audio.ndim > 1 else audio
 
     def speak(self, text: str, temperature: float = 0.8):
-        """Speak text with sentence-level pipelining. Can be interrupted."""
+        """Speak text. Uses streaming if voice set, otherwise sentence-level."""
         self._interrupted.clear()
 
-        # Split into sentences
+        if self._stream_pipeline:
+            self._speak_streaming(text, temperature)
+        else:
+            self._speak_basic(text, temperature)
+
+    def _speak_streaming(self, text: str, temperature: float = 0.8):
+        """Streaming: split into clauses, stream each clause's audio chunks."""
+        clean = re.sub(r'<(?!/?(?:laugh|chuckle|pause|sigh|gasp))[^>]+>', '', text).strip()
+        if not clean:
+            return
+
+        # Split into clauses for lower latency
+        clauses = []
+        remaining = clean
+        while remaining:
+            boundary = find_clause_boundary(remaining, 20, 150)
+            if boundary:
+                clauses.append(remaining[:boundary].strip())
+                remaining = remaining[boundary:].lstrip()
+            else:
+                clauses.append(remaining.strip())
+                break
+
+        for clause in clauses:
+            if self._interrupted.is_set():
+                return
+            if not clause:
+                continue
+            for chunk in self._stream_pipeline.stream(text=clause, temperature=temperature):
+                if self._interrupted.is_set():
+                    return
+                self.player.play(chunk.audio, chunk.sample_rate)
+
+    def _speak_basic(self, text: str, temperature: float = 0.8):
+        """Fallback: sentence-level generation + pipelined playback."""
         sentences = re.split(r'(?<=[.!?])\s+', text)
         merged = []
         for s in sentences:
@@ -267,7 +336,6 @@ class TTSPipeline:
         if not merged:
             return
 
-        # Pipeline: generate first, then overlap play+generate
         current_audio = self._generate_audio(merged[0], temperature=temperature)
 
         for i in range(len(merged)):
@@ -280,7 +348,6 @@ class TTSPipeline:
                 continue
 
             if i + 1 < len(merged):
-                # Play current in background thread while generating next
                 play_thread = threading.Thread(
                     target=self.player.play,
                     args=(current_audio, self.tts.sr),
@@ -288,7 +355,6 @@ class TTSPipeline:
                 )
                 play_thread.start()
 
-                # Generate next while playing
                 if not self._interrupted.is_set():
                     next_audio = self._generate_audio(merged[i + 1], temperature=temperature)
                 else:
@@ -298,7 +364,6 @@ class TTSPipeline:
                 play_thread.join()
                 current_audio = next_audio
             else:
-                # Last sentence
                 if not self._interrupted.is_set():
                     self.player.play(current_audio, self.tts.sr)
 
@@ -363,6 +428,90 @@ def stream_generate(model, tokenizer, messages, max_new_tokens=2048,
     gen_thread.join(timeout=2)
 
 
+def stream_generate_with_audio(model, tokenizer, messages, audio_embeds,
+                                max_new_tokens=2048, interrupt_event=None):
+    """Stream tokens using WhisperAdapter audio embeddings for the last user message.
+
+    Like stream_generate but replaces the last user message's text tokens
+    with audio embeddings from WhisperAdapter. This preserves tone, emphasis,
+    and prosody information that gets lost in text transcription.
+
+    The chat template is split at the user message boundary:
+      [context tokens] + [audio embeddings] + [generation prefix tokens]
+    """
+    from transformers import TextIteratorStreamer
+
+    # Build chat template with a placeholder we can split on
+    placeholder = "AUDIO_INPUT_PLACEHOLDER_XYZ"
+    messages_with_placeholder = messages[:-1] + [
+        {"role": "user", "content": placeholder}
+    ]
+    full_text = tokenizer.apply_chat_template(
+        messages_with_placeholder, tokenize=False,
+        add_generation_prompt=True, enable_thinking=True,
+    )
+
+    before_text, after_text = full_text.split(placeholder)
+
+    # Tokenize the text parts (without adding special tokens — template has them)
+    before_ids = tokenizer(before_text, return_tensors="pt",
+                           add_special_tokens=False).input_ids.to(model.device)
+    after_ids = tokenizer(after_text, return_tensors="pt",
+                          add_special_tokens=False).input_ids.to(model.device)
+
+    # Get text embeddings for context + generation prefix
+    embed_layer = model.get_input_embeddings()
+    before_emb = embed_layer(before_ids)   # [1, prefix_len, dim]
+    after_emb = embed_layer(after_ids)     # [1, suffix_len, dim]
+
+    # audio_embeds: [1, audio_frames, dim] — from WhisperAdapter
+    # Match dtype
+    audio_embeds = audio_embeds.to(dtype=before_emb.dtype)
+
+    # Concatenate: context + audio features + generation prefix
+    inputs_embeds = torch.cat([before_emb, audio_embeds, after_emb], dim=1)
+    attention_mask = torch.ones(1, inputs_embeds.shape[1],
+                                device=model.device, dtype=torch.long)
+
+    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=False)
+
+    gen_thread = threading.Thread(
+        target=lambda: model.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            temperature=0.7,
+            top_p=0.9,
+            repetition_penalty=1.1,
+            do_sample=True,
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+            streamer=streamer,
+        ),
+        daemon=True,
+    )
+    gen_thread.start()
+
+    accumulated = "<think>"
+    stop_tokens = ["<|im_end|>", "<|endoftext|>"]
+
+    for chunk in streamer:
+        if interrupt_event and interrupt_event.is_set():
+            break
+
+        accumulated += chunk
+
+        for stop in stop_tokens:
+            if stop in accumulated:
+                accumulated = accumulated[:accumulated.index(stop)]
+                gen_thread.join(timeout=2)
+                yield chunk, accumulated
+                return
+
+        yield chunk, accumulated
+
+    gen_thread.join(timeout=2)
+
+
 def extract_blocks(text: str) -> list[dict]:
     """Extract completed blocks from accumulated text."""
     blocks = []
@@ -403,7 +552,8 @@ class LiveAgent:
 
     def __init__(self, thinker, tokenizer, whisper_model=None,
                  tts_model=None, workspace=".", text_mode=False, no_tts=False,
-                 probe=None, capture=None):
+                 probe=None, capture=None, voice_path=None, connector=None,
+                 adapter=None):
         self.thinker = thinker
         self.tokenizer = tokenizer
         self.whisper = whisper_model
@@ -411,7 +561,10 @@ class LiveAgent:
         self.no_tts = no_tts
         self.probe = probe
         self.capture = capture
+        self.connector = connector  # HiddenStateConnector (when trained)
+        self.adapter = adapter      # WhisperAdapter (when trained)
         self._current_emotion = "neutral"
+        self._last_audio_embeds = None  # Adapter output for current user turn
 
         # Tools & memory
         self.tools = ToolExecutor(workspace=workspace)
@@ -420,8 +573,19 @@ class LiveAgent:
 
         # Audio I/O
         self.player = AudioPlayer()
-        self.tts_pipe = TTSPipeline(tts_model, self.player) if tts_model else None
+        self.tts_pipe = TTSPipeline(tts_model, self.player, voice_path=voice_path) if tts_model else None
         self.mic = MicListener() if not text_mode else None
+
+        # Direct hidden state → speech path (when connector + voice available)
+        self.tts_connector = None
+        if connector is not None and tts_model is not None and voice_path is not None:
+            self.tts_connector = ThinkerTalkerConnector(
+                voice_path=voice_path,
+                device=str(thinker.device) if hasattr(thinker, 'device') else "cuda",
+                hidden_connector=connector,
+            )
+            self.tts_connector._tts = tts_model  # Reuse loaded TTS (no double-load)
+            print(f"  \033[92mDirect hidden state → speech path enabled\033[0m")
 
         # Queues for async pipeline
         self.input_queue = queue.Queue()    # User text input
@@ -463,8 +627,19 @@ class LiveAgent:
                 text = transcribe(self.whisper, audio)
                 stt_time = time.time() - t0
 
+                # Run WhisperAdapter for rich audio features (if available)
+                if self.adapter and text and len(text) > 1:
+                    try:
+                        with torch.no_grad():
+                            audio_tensor = torch.tensor(audio, dtype=torch.float32).unsqueeze(0)
+                            self._last_audio_embeds = self.adapter(audio=audio_tensor)
+                    except Exception as e:
+                        log.warning(f"WhisperAdapter failed: {e}")
+                        self._last_audio_embeds = None
+
                 if text and len(text) > 1:
-                    print(f"\rYou: {text}  \033[90m({stt_time:.1f}s STT)\033[0m")
+                    adapter_tag = " +adapter" if self._last_audio_embeds is not None else ""
+                    print(f"\rYou: {text}  \033[90m({stt_time:.1f}s STT{adapter_tag})\033[0m")
                     self.input_queue.put(text)
 
             except Exception as e:
@@ -510,11 +685,24 @@ class LiveAgent:
             in_think = True
             blocks_yielded = set()  # Track which blocks we've already processed
 
+            # Use adapter path when audio embeddings are available
+            audio_embeds = self._last_audio_embeds
+            self._last_audio_embeds = None  # Consume
+
+            if audio_embeds is not None:
+                gen_source = stream_generate_with_audio(
+                    self.thinker, self.tokenizer, self.messages, audio_embeds,
+                    interrupt_event=self.interrupt,
+                )
+                print("  \033[94m[adapter: audio → Thinker]\033[0m")
+            else:
+                gen_source = stream_generate(
+                    self.thinker, self.tokenizer, self.messages,
+                    interrupt_event=self.interrupt,
+                )
+
             sys.stdout.write("  ")
-            for chunk, acc in stream_generate(
-                self.thinker, self.tokenizer, self.messages,
-                interrupt_event=self.interrupt,
-            ):
+            for chunk, acc in gen_source:
                 accumulated = acc
 
                 # Live token printing: gray for think, white for speech
@@ -631,11 +819,56 @@ class LiveAgent:
         self._wait_for_speech()
 
     def _speak_and_clear(self, text: str, temperature: float = 0.8):
-        """Speak text and clear the speaking flag when done."""
+        """Speak text and clear the speaking flag when done.
+
+        Uses hidden state → speech path when connector is available,
+        otherwise falls back to text → TTS path.
+        """
         try:
-            self.tts_pipe.speak(text, temperature=temperature)
+            if self.tts_connector and self.probe and self.capture:
+                try:
+                    self._speak_from_hidden(text, temperature)
+                except Exception as e:
+                    log.warning(f"Connector speech failed ({e}), falling back to text path")
+                    self.tts_pipe.speak(text, temperature=temperature)
+            else:
+                self.tts_pipe.speak(text, temperature=temperature)
         finally:
             self._speaking = False
+
+    def _speak_from_hidden(self, text: str, temperature: float = 0.8):
+        """Generate speech from Thinker hidden states via HiddenStateConnector.
+
+        Bypasses text decoding: hidden states are projected directly into T3's
+        embedding space, preserving emotion/prosody information.
+        """
+        # Forward pass to get hidden states for this text
+        tokens = self.tokenizer(text, return_tensors="pt").to(self.thinker.device)
+        with torch.no_grad():
+            self.capture.clear()
+            out = self.thinker(**tokens, output_hidden_states=True)
+            if hasattr(out, 'hidden_states') and out.hidden_states:
+                hidden = out.hidden_states[-1]
+            else:
+                all_states = {**self.capture.deltanet_states, **self.capture.attention_states}
+                if not all_states:
+                    raise RuntimeError("No hidden states captured")
+                hidden = all_states[max(all_states.keys())]
+
+            # Get emotion vector from probe
+            delta_f32 = {k: v.float() for k, v in self.capture.deltanet_states.items()}
+            attn_f32 = {k: v.float() for k, v in self.capture.attention_states.items()}
+            probe_out = self.probe(delta_f32, attn_f32)
+            emotion_vector = probe_out.get("conditioning_vector")
+
+        # Generate audio via connector (hidden states → T3 embeddings → speech)
+        audio = self.tts_connector.generate_from_hidden(
+            thinker_hidden=hidden,
+            emotion_vector=emotion_vector,
+            temperature=temperature,
+        )
+        audio_np = audio.squeeze().cpu().numpy().astype(np.float32)
+        self.player.play(audio_np, self.tts_connector.sr)
 
     def _wait_for_speech(self):
         """Wait for TTS to finish playing."""
@@ -737,6 +970,7 @@ def main():
     parser.add_argument("--no-tts", action="store_true", help="No voice output")
     parser.add_argument("--no-stt", action="store_true", help="No voice input")
     parser.add_argument("--workspace", default=".")
+    parser.add_argument("--voice", default=None, help="Reference voice WAV for streaming TTS")
     args = parser.parse_args()
 
     if args.no_stt:
@@ -755,6 +989,15 @@ def main():
     whisper_model = load_whisper(device=args.device) if not args.text else None
     tts_model = load_chatterbox(device=args.device) if not args.no_tts else None
 
+    # Load WhisperAdapter (audio → Thinker embedding space)
+    adapter = None
+    adapter_path = os.path.join(os.path.dirname(__file__), "..", "checkpoints", "adapter", "adapter_best.pt")
+    if os.path.exists(adapter_path) and not args.text:
+        try:
+            adapter = load_adapter(adapter_path, device=args.device)
+        except Exception as e:
+            print(f"  WhisperAdapter load failed: {e} — using text-only STT")
+
     # Load emotion probe
     probe = None
     capture = None
@@ -770,6 +1013,22 @@ def main():
     else:
         print(f"  Emotion probe not found at {probe_path}, running without emotion detection")
 
+    # Load HiddenStateConnector (if trained)
+    connector = None
+    connector_path = os.path.join(os.path.dirname(__file__), "..", "checkpoints", "connector", "connector_best.pt")
+    if os.path.exists(connector_path):
+        print("Loading HiddenStateConnector...")
+        t0 = time.time()
+        connector = HiddenStateConnector(thinker_dim=1024, t3_dim=1024, emotion_dim=14)
+        connector.load_state_dict(torch.load(connector_path, map_location=args.device, weights_only=True))
+        connector = connector.to(args.device).eval()
+        for p in connector.parameters():
+            p.requires_grad = False
+        print(f"  Loaded in {time.time() - t0:.1f}s (direct hidden state → T3 path enabled)")
+    else:
+        print("  HiddenStateConnector not trained yet — using text path")
+        print(f"  Train with: python -m src.training.train_stage4")
+
     if args.device == "cuda":
         print(f"\nVRAM used: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
 
@@ -778,6 +1037,7 @@ def main():
         whisper_model=whisper_model, tts_model=tts_model,
         workspace=args.workspace, text_mode=args.text, no_tts=args.no_tts,
         probe=probe, capture=capture,
+        voice_path=args.voice, connector=connector, adapter=adapter,
     )
     agent.run()
 

@@ -5,19 +5,23 @@ End-to-end speech agent: Qwen 3.5 0.8B Thinker + Chatterbox Turbo 350M Talker wi
 ## Architecture
 
 ```
-[Mic] -> faster-whisper STT (real-time transcription)
-      -> Text input
+[Mic] -> faster-whisper STT (text for display + history)
+      -> WhisperAdapter (audio → Thinker embeddings, preserves tone/prosody)
       -> Qwen 3.5 0.8B Thinker (LoRA, streaming via TextIteratorStreamer)
           |-- tool_call? -> intercept, execute, feed back
           |-- hidden states -> Dual Emotion Probe:
           |     DeltaNet states (18 layers) -> mood/energy/pace
           |     Attention layers (6 layers) -> emphasis/surprise
           |     -> conditioning_vector (14-dim: 10 emotions + 4 prosody)
-          |-- text (streamed clause-by-clause)
-                  |
-          Connector (rule-based emotion -> style mapping)
-          emotion_label -> { exaggeration, cfg_weight, temperature }
-                  |
+          |
+          |-- PATH A (trained connector):
+          |     hidden states -> HiddenStateConnector (~2M) -> T3 text embeddings
+          |     Bypasses text decoding — preserves emotion/prosody in embeddings
+          |
+          |-- PATH B (text fallback):
+          |     text (streamed clause-by-clause) -> T3 tokenizer -> T3 text embeddings
+          |     Rule-based emotion -> style mapping { temperature, exaggeration }
+          |
           Chatterbox Turbo (350M) — streaming TTS
           T3 generates speech tokens -> vocode every 50 tokens -> audio chunks
                   |
@@ -44,11 +48,14 @@ First audio in ~0.3s instead of ~1.5s without overlap.
 The live agent runs with concurrent mic listening, thinking, and speaking:
 
 ```bash
-# Full voice mode (mic + TTS)
+# Full voice mode (mic + TTS) — basic generation
 CUDA_VISIBLE_DEVICES=1 python scripts/live_agent.py
 
+# Streaming TTS with reference voice (clause-level, speech-token streaming)
+CUDA_VISIBLE_DEVICES=1 python scripts/live_agent.py --voice data/reference_speakers/voice.wav
+
 # Keyboard input, voice output
-CUDA_VISIBLE_DEVICES=1 python scripts/live_agent.py --text
+CUDA_VISIBLE_DEVICES=1 python scripts/live_agent.py --text --voice voice.wav
 
 # Pure text mode
 CUDA_VISIBLE_DEVICES=1 python scripts/live_agent.py --text --no-tts
@@ -57,7 +64,9 @@ CUDA_VISIBLE_DEVICES=1 python scripts/live_agent.py --text --no-tts
 Features:
 - Always-on mic with VAD (voice activity detection)
 - User speech interrupts agent mid-sentence
-- Emotion-aware TTS (probe detects emotion, connector maps to Chatterbox style)
+- Emotion-aware TTS (probe detects emotion, adjusts TTS temperature)
+- Streaming TTS with `--voice`: clause-level splitting + speech-token streaming (~0.3s first audio)
+- HiddenStateConnector: when trained, bypasses text decoding for richer speech (auto-detected)
 - Tool calling (file ops, git, web search, memory, timers)
 - Streaming token display (thinking in gray, speech in white)
 
@@ -65,7 +74,7 @@ Features:
 
 ### Stage 1: Whisper Adapter
 
-Maps Whisper encoder features into Thinker embedding space (for future end-to-end speech input).
+Maps Whisper encoder features into Thinker embedding space. In inference, when mic input is captured, audio features are fed directly to the Thinker via `inputs_embeds` — preserving tone, emphasis, and prosody that text transcription loses. Faster-whisper STT still runs in parallel for text display and conversation history.
 
 ```bash
 python -m src.training.train_stage1 --lora-path checkpoints/living-agent/lora
@@ -140,9 +149,8 @@ CUDA_VISIBLE_DEVICES=1 bash scripts/train_all_stages.sh
 | CNN Adapter (Whisper→Thinker) | ~2M | Stage 1 | `checkpoints/adapter/` |
 | Qwen 3.5 0.8B Thinker | 0.8B | LoRA (~16M) | `checkpoints/living-agent/lora/` |
 | Emotion/Prosody Probe | ~2M | Stage 3 | `checkpoints/probe/` |
-| Connector (rule-based) | 0 | No | N/A |
-| StyleMapper (optional) | ~10K | Stage 4 | `checkpoints/connector/` |
-| ECAPA-TDNN speaker encoder | ~7M | Frozen | SpeechBrain |
+| HiddenStateConnector (Thinker→T3) | ~2M | Stage 4 | `checkpoints/connector/` |
+| Rule-based style fallback | 0 | No | N/A |
 | Chatterbox Turbo Talker | 350M | Frozen | HuggingFace |
 
 ## Datasets

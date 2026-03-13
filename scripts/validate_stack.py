@@ -311,6 +311,112 @@ def validate_connector(report):
                f"\"{clean}\"")
 
 
+def validate_hidden_connector(report, lora_path, probe_ckpt, connector_ckpt, device):
+    """Validate HiddenStateConnector projects Thinker states into T3 space."""
+    print(f"\n{'─' * 70}")
+    print("3b. HIDDEN STATE CONNECTOR — Thinker→T3 Projection")
+    print(f"{'─' * 70}")
+
+    from src.model.connector import HiddenStateConnector
+
+    if not os.path.exists(connector_ckpt):
+        report.add("HiddenConnector", "Checkpoint exists", False,
+                    f"Not found: {connector_ckpt}. Train with: python -m src.training.train_stage4")
+        return
+
+    # Load connector
+    connector = HiddenStateConnector(thinker_dim=1024, t3_dim=1024, emotion_dim=14)
+    connector.load_state_dict(torch.load(connector_ckpt, map_location=device, weights_only=True))
+    connector = connector.to(device).eval()
+    trainable = sum(p.numel() for p in connector.parameters())
+    report.add("HiddenConnector", "Checkpoint loaded", True,
+               f"{trainable:,} params from {connector_ckpt}")
+
+    # Load Thinker for hidden states
+    import unsloth
+    from unsloth import FastLanguageModel
+    from src.model.emotion_probe import EmotionProbe
+    from src.training.train_probe import HiddenStateCapture
+
+    thinker, processor = FastLanguageModel.from_pretrained(
+        lora_path, device_map=device, dtype=torch.bfloat16,
+    )
+    FastLanguageModel.for_inference(thinker)
+    thinker.eval()
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+    hidden_size = thinker.config.get_text_config().hidden_size
+    capture = HiddenStateCapture(thinker)
+
+    probe = EmotionProbe(hidden_size=hidden_size).to(device)
+    if os.path.exists(probe_ckpt):
+        probe.load_state_dict(torch.load(probe_ckpt, map_location=device))
+    probe.eval()
+
+    # Test: forward pass through connector
+    test_texts = [
+        "Hello, how are you doing today?",
+        "I'm really excited about this!",
+        "The quick brown fox jumps over the lazy dog.",
+    ]
+
+    for text in test_texts:
+        tokens = tokenizer(text, return_tensors="pt").to(device)
+        with torch.no_grad():
+            capture.clear()
+            out = thinker(**tokens, output_hidden_states=True)
+            if hasattr(out, 'hidden_states') and out.hidden_states:
+                hidden = out.hidden_states[-1]
+            else:
+                all_states = {**capture.deltanet_states, **capture.attention_states}
+                hidden = all_states[max(all_states.keys())]
+
+            delta_f32 = {k: v.float() for k, v in capture.deltanet_states.items()}
+            attn_f32 = {k: v.float() for k, v in capture.attention_states.items()}
+            probe_out = probe(delta_f32, attn_f32)
+            emotion_vector = probe_out.get("conditioning_vector")
+
+            # Run connector
+            t3_emb = connector(hidden.float(), emotion_vector, target_length=64)
+
+        # Validate output shape and values
+        correct_shape = t3_emb.shape == (1, 64, 1024)
+        has_values = not torch.isnan(t3_emb).any() and not torch.isinf(t3_emb).any()
+        norm = t3_emb.norm(dim=-1).mean().item()
+        reasonable_norm = 0.1 < norm < 100
+
+        report.add("HiddenConnector",
+                    f"Projection: \"{text[:35]}...\"",
+                    correct_shape and has_values and reasonable_norm,
+                    f"shape={list(t3_emb.shape)}, norm={norm:.2f}")
+
+    # Test: different emotions produce different projections
+    with torch.no_grad():
+        tokens = tokenizer("This is a test.", return_tensors="pt").to(device)
+        capture.clear()
+        out = thinker(**tokens, output_hidden_states=True)
+        hidden = out.hidden_states[-1] if hasattr(out, 'hidden_states') and out.hidden_states else None
+
+        if hidden is not None:
+            # Fake neutral vs excited emotion vectors
+            neutral_ev = torch.zeros(1, 14, device=device)
+            neutral_ev[0, 0] = 1.0  # neutral
+            excited_ev = torch.zeros(1, 14, device=device)
+            excited_ev[0, 4] = 1.0  # excited
+
+            proj_neutral = connector(hidden.float(), neutral_ev, target_length=32)
+            proj_excited = connector(hidden.float(), excited_ev, target_length=32)
+
+            diff = (proj_neutral - proj_excited).abs().mean().item()
+            report.add("HiddenConnector", "Emotion differentiation",
+                       diff > 0.01,
+                       f"neutral vs excited diff={diff:.4f}")
+
+    capture.remove_hooks()
+    del thinker
+    torch.cuda.empty_cache()
+
+
 def validate_tts(report, voice_path, device):
     """Validate TTS produces intelligible speech (verified by Whisper)."""
     print(f"\n{'─' * 70}")
@@ -641,12 +747,16 @@ def main():
         print(f"  Run Stage 2 (train_lora.py) first!")
         return
 
+    connector_ckpt = "checkpoints/connector/connector_best.pt"
+
     try:
         if run_all or args.component == "thinker":
             validate_thinker(report, args.lora_path, args.device)
 
         if run_all or args.component == "connector":
             validate_connector(report)
+            validate_hidden_connector(report, args.lora_path, args.probe_ckpt,
+                                       connector_ckpt, args.device)
 
         if run_all or args.component == "probe":
             validate_probe(report, args.lora_path, args.probe_ckpt, args.device)
