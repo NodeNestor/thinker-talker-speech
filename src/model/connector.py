@@ -1,102 +1,257 @@
-"""Thinker->Talker Connector — bridges hidden states to the Talker's input space.
+"""Thinker->Talker Connector — translates Thinker internal state to Chatterbox style parameters.
 
-The connector takes:
-  1. Thinker hidden states (text semantics)
-  2. Emotion/prosody conditioning vector (from the probe)
-  3. Speaker embedding (from ECAPA-TDNN)
+The connector is the glue between thinking and speaking. It does NOT predict audio.
+Instead, it takes:
+  1. Thinker's text output (what to say)
+  2. Emotion probe output (how the Thinker "feels" about it)
+  3. Prosody signals (speed, pitch, energy, emphasis)
 
-And produces a unified conditioning signal for the Talker via
-Adaptive Layer Normalization (AdaLN).
+And maps them to Chatterbox's generation parameters:
+  - exaggeration (emotion intensity) — full Chatterbox only
+  - cfg_weight (how closely to follow conditioning)
+  - temperature (sampling diversity)
+  - speaking style via modified conditioning embeddings
 
-This is the key integration point — it's small (~5M params) and
-is the main thing we train in Stage 4.
+Chatterbox does all the heavy lifting (text → speech tokens → mel → audio).
+The connector just tells it HOW to say it.
 """
 
+import re
 import torch
 import torch.nn as nn
 
+from .emotion_probe import EMOTION_LABELS, PROSODY_DIMS
 
-class AdaptiveLayerNorm(nn.Module):
-    """Adaptive Layer Normalization — conditions normalization on a style vector.
 
-    Used to inject speaker identity and emotion into the Talker.
-    scale = Linear(style) + 1, shift = Linear(style)
-    output = scale * LayerNorm(x) + shift
+# Map emotion labels to base exaggeration levels
+EMOTION_EXAGGERATION = {
+    "neutral": 0.3,
+    "happy": 0.6,
+    "sad": 0.5,
+    "angry": 0.8,
+    "excited": 0.9,
+    "fearful": 0.7,
+    "surprised": 0.8,
+    "disgusted": 0.6,
+    "calm": 0.2,
+    "confused": 0.5,
+}
+
+# Map emotion labels to temperature adjustments
+EMOTION_TEMPERATURE = {
+    "neutral": 0.7,
+    "happy": 0.85,
+    "sad": 0.75,
+    "angry": 0.9,
+    "excited": 0.95,
+    "fearful": 0.8,
+    "surprised": 0.9,
+    "disgusted": 0.75,
+    "calm": 0.65,
+    "confused": 0.8,
+}
+
+
+class StyleMapper(nn.Module):
+    """Learned mapping from emotion/prosody vector to Chatterbox style parameters.
+
+    Maps the probe's 14-dim conditioning vector (10 emotions + 4 prosody) to:
+      - exaggeration: float [0, 1] — emotion intensity for Chatterbox
+      - cfg_weight: float [0, 1] — classifier-free guidance strength
+      - temperature: float [0.5, 1.2] — sampling diversity
+
+    Small network (~10K params) trained on (emotion_vector, target_style) pairs.
+    Falls back to rule-based mapping if untrained.
     """
 
-    def __init__(self, hidden_size: int, conditioning_size: int):
+    def __init__(self, emotion_dim: int = 14):
         super().__init__()
-        self.norm = nn.LayerNorm(hidden_size)
-        self.scale_proj = nn.Linear(conditioning_size, hidden_size)
-        self.shift_proj = nn.Linear(conditioning_size, hidden_size)
+        self.net = nn.Sequential(
+            nn.Linear(emotion_dim, 64),
+            nn.SiLU(),
+            nn.Linear(64, 32),
+            nn.SiLU(),
+            nn.Linear(32, 3),  # exaggeration, cfg_weight, temperature
+        )
 
-    def forward(self, x: torch.Tensor, conditioning: torch.Tensor) -> torch.Tensor:
+    def forward(self, conditioning_vector: torch.Tensor) -> dict:
         """
         Args:
-            x: [batch, seq, hidden]
-            conditioning: [batch, conditioning_size]
+            conditioning_vector: [batch, 14] from EmotionProbe
+
+        Returns:
+            dict with exaggeration, cfg_weight, temperature (all scalars)
         """
-        normed = self.norm(x)
-        # Expand conditioning to match sequence dim
-        scale = self.scale_proj(conditioning).unsqueeze(1) + 1.0
-        shift = self.shift_proj(conditioning).unsqueeze(1)
-        return normed * scale + shift
+        raw = self.net(conditioning_vector)  # [batch, 3]
+        # Constrain outputs to valid ranges
+        exaggeration = torch.sigmoid(raw[:, 0])          # [0, 1]
+        cfg_weight = torch.sigmoid(raw[:, 1]) * 0.8      # [0, 0.8]
+        temperature = torch.sigmoid(raw[:, 2]) * 0.7 + 0.5  # [0.5, 1.2]
+
+        return {
+            "exaggeration": exaggeration.mean().item(),
+            "cfg_weight": cfg_weight.mean().item(),
+            "temperature": temperature.mean().item(),
+        }
 
 
-class ThinkerTalkerConnector(nn.Module):
-    """Connects Thinker output to Talker input.
+class ThinkerTalkerConnector:
+    """Connects Thinker output to Chatterbox TTS.
 
-    Merges three signals into a single conditioning tensor:
-    - Thinker hidden states (semantic content)
-    - Emotion/prosody vector (how to say it)
-    - Speaker embedding (whose voice to use)
+    This is the pipeline glue — not a neural network predicting audio.
+    It translates Thinker's internal state into Chatterbox generation calls.
+
+    Usage:
+        connector = ThinkerTalkerConnector(voice_path="speaker.wav")
+        audio = connector.generate(
+            text="Hello world!",
+            emotion_label="happy",
+            prosody={"speed": 1.2, "energy": 1.0, ...},
+            conditioning_vector=probe_output,
+        )
     """
 
     def __init__(
         self,
-        thinker_hidden_size: int = 1024,
-        talker_hidden_size: int = 512,  # Chatterbox Turbo or custom Talker
-        emotion_dim: int = 14,          # 10 emotions + 4 prosody
-        speaker_dim: int = 192,         # ECAPA-TDNN
+        voice_path: str = None,
+        device: str = "cuda",
+        use_turbo: bool = True,
+        style_mapper: StyleMapper = None,
     ):
-        super().__init__()
+        self.voice_path = voice_path
+        self.device = device
+        self.use_turbo = use_turbo
+        self.style_mapper = style_mapper
+        self._tts = None
+        self._tts_full = None
 
-        # Project Thinker hidden states to Talker dimension
-        self.content_proj = nn.Sequential(
-            nn.Linear(thinker_hidden_size, talker_hidden_size),
-            nn.SiLU(),
-            nn.Linear(talker_hidden_size, talker_hidden_size),
-        )
+    @property
+    def tts(self):
+        """Lazy-load Chatterbox TTS."""
+        if self.use_turbo:
+            if self._tts is None:
+                from chatterbox.tts_turbo import ChatterboxTurboTTS
+                self._tts = ChatterboxTurboTTS.from_pretrained(device=self.device)
+            return self._tts
+        else:
+            if self._tts_full is None:
+                from chatterbox.tts import ChatterboxTTS
+                self._tts_full = ChatterboxTTS.from_pretrained(device=self.device)
+            return self._tts_full
 
-        # Fuse emotion + speaker into a style vector
-        style_dim = emotion_dim + speaker_dim
-        self.style_fuse = nn.Sequential(
-            nn.Linear(style_dim, talker_hidden_size),
-            nn.SiLU(),
-            nn.Linear(talker_hidden_size, talker_hidden_size),
-        )
+    def clean_text(self, text: str) -> str:
+        """Clean Thinker output for TTS consumption.
 
-        # AdaLN: condition content with style
-        self.adaln = AdaptiveLayerNorm(talker_hidden_size, talker_hidden_size)
+        Removes thinking tokens, tool calls, SSML-like tags, and
+        converts paralinguistic markers to TTS-friendly format.
+        """
+        # Remove tool calls
+        text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL)
 
-    def forward(
+        # Remove thinking tags
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+
+        # Remove SSML-like tags but keep content
+        text = re.sub(r"<speak[^>]*>", "", text)
+        text = re.sub(r"</speak>", "", text)
+
+        # Keep paralinguistic markers that Chatterbox might handle
+        # [laugh], [chuckle], [pause], [sigh] etc.
+        # These are actually handled well by some TTS systems
+
+        # Clean up whitespace
+        text = re.sub(r"\s+", " ", text).strip()
+
+        return text
+
+    def map_style(self, emotion_label: str = None, prosody: dict = None,
+                  conditioning_vector: torch.Tensor = None) -> dict:
+        """Map emotion/prosody to Chatterbox generation parameters."""
+
+        # If we have a trained StyleMapper and conditioning vector, use it
+        if self.style_mapper is not None and conditioning_vector is not None:
+            with torch.no_grad():
+                if conditioning_vector.dim() == 1:
+                    conditioning_vector = conditioning_vector.unsqueeze(0)
+                return self.style_mapper(conditioning_vector.float())
+
+        # Fall back to rule-based mapping
+        params = {
+            "exaggeration": 0.5,
+            "cfg_weight": 0.5,
+            "temperature": 0.8,
+        }
+
+        if emotion_label:
+            params["exaggeration"] = EMOTION_EXAGGERATION.get(emotion_label, 0.5)
+            params["temperature"] = EMOTION_TEMPERATURE.get(emotion_label, 0.8)
+
+        if prosody:
+            # Energy affects exaggeration
+            energy = prosody.get("energy", 1.0)
+            params["exaggeration"] *= min(energy, 1.5)
+            params["exaggeration"] = min(params["exaggeration"], 1.0)
+
+            # Speed affects nothing directly for Chatterbox (it controls its own pacing)
+            # But very fast/slow speech might benefit from different temperatures
+            speed = prosody.get("speed", 1.0)
+            if speed > 1.5:
+                params["temperature"] = min(params["temperature"] + 0.1, 1.0)
+
+        return params
+
+    def generate(
         self,
-        thinker_hidden: torch.Tensor,       # [batch, seq, thinker_hidden]
-        emotion_vector: torch.Tensor,        # [batch, emotion_dim]
-        speaker_embedding: torch.Tensor,     # [batch, speaker_dim]
+        text: str,
+        emotion_label: str = None,
+        prosody: dict = None,
+        conditioning_vector: torch.Tensor = None,
+        voice_path: str = None,
     ) -> torch.Tensor:
-        """
+        """Generate speech from text with emotion-aware style.
+
+        Args:
+            text: Raw text from Thinker (will be cleaned)
+            emotion_label: Detected emotion (e.g., "happy", "angry")
+            prosody: Prosody dict from probe (speed, pitch, energy, emphasis)
+            conditioning_vector: Raw 14-dim vector from probe (for StyleMapper)
+            voice_path: Override voice reference (uses default if None)
+
         Returns:
-            talker_input: [batch, seq, talker_hidden] — ready for Talker
+            Audio waveform tensor
         """
-        # Project content
-        content = self.content_proj(thinker_hidden)  # [batch, seq, talker_hidden]
+        voice = voice_path or self.voice_path
+        assert voice is not None, "No voice reference provided"
 
-        # Fuse style signals
-        style = torch.cat([emotion_vector, speaker_embedding], dim=-1)
-        style = self.style_fuse(style)  # [batch, talker_hidden]
+        # Clean text for TTS
+        clean = self.clean_text(text)
+        if not clean:
+            clean = "..."
 
-        # Apply AdaLN — condition content with style
-        output = self.adaln(content, style)
+        # Map emotion to style parameters
+        style = self.map_style(emotion_label, prosody, conditioning_vector)
 
-        return output
+        # Generate with appropriate Chatterbox version
+        if self.use_turbo:
+            # Turbo: limited style controls
+            wav = self.tts.generate(
+                text=clean,
+                audio_prompt_path=voice,
+                temperature=style["temperature"],
+            )
+        else:
+            # Full: has emotion_adv (exaggeration) and CFG
+            wav = self.tts.generate(
+                text=clean,
+                audio_prompt_path=voice,
+                exaggeration=style["exaggeration"],
+                cfg_weight=style["cfg_weight"],
+                temperature=style["temperature"],
+            )
+
+        return wav
+
+    @property
+    def sr(self) -> int:
+        """Sample rate of generated audio."""
+        return self.tts.sr

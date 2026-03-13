@@ -344,6 +344,7 @@ def train_stage4(
         total_loss = 0
         total_recon = 0
         total_speaker = 0
+        total_duration = 0
         num_batches = 0
 
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{num_epochs}")
@@ -384,28 +385,35 @@ def train_stage4(
                     else:
                         speaker_emb = torch.randn(input_ids.shape[0], 192, device=device)
 
-                # ── Step 4: Connector forward (trainable) ──
-                connector_out = connector(
+                # ── Step 4: Compute target mel FIRST (need length for upsampling) ──
+                with torch.no_grad():
+                    target_mel = compute_mel_spectrogram(audio)  # [batch, time, 80]
+                target_len = target_mel.shape[1]
+
+                # ── Step 5: Connector forward (trainable) — upsample to mel rate ──
+                connector_out, predicted_durations = connector.forward_with_durations(
                     thinker_hidden=thinker_hidden,
                     emotion_vector=emotion_vector,
                     speaker_embedding=speaker_emb,
+                    target_length=target_len,
                 )
-                # connector_out: [batch, seq, 512]
+                # connector_out: [batch, target_len, 512]
 
-                # ── Step 5: Mel decoder (trainable) → predict mel ──
-                predicted_mel = mel_decoder(connector_out)  # [batch, seq, 80]
-
-                # ── Step 6: Target mel from audio ──
-                with torch.no_grad():
-                    target_mel = compute_mel_spectrogram(audio)  # [batch, time, 80]
-
-                # ── Align sequence lengths for loss ──
-                min_len = min(predicted_mel.shape[1], target_mel.shape[1])
-                predicted_mel = predicted_mel[:, :min_len, :]
-                target_mel = target_mel[:, :min_len, :]
+                # ── Step 6: Mel decoder (trainable) → predict mel ──
+                predicted_mel = mel_decoder(connector_out)  # [batch, target_len, 80]
 
                 # ── Loss 1: Reconstruction (MSE on mel) ──
                 recon_loss = F.mse_loss(predicted_mel, target_mel)
+
+                # ── Loss 2: Duration prediction ──
+                # Target: uniform distribution of frames across tokens
+                seq_len = thinker_hidden.shape[1]
+                target_dur = torch.full(
+                    (input_ids.shape[0], seq_len),
+                    target_len / seq_len,
+                    device=device,
+                )
+                duration_loss = F.mse_loss(predicted_durations, target_dur)
 
                 # ── Loss 2: Speaker consistency (contrastive) ──
                 # Connector outputs for same speaker should be closer
@@ -432,7 +440,8 @@ def train_stage4(
                     )
 
                 # ── Combined loss ──
-                loss = recon_weight * recon_loss + speaker_weight * speaker_loss
+                duration_weight = 0.1
+                loss = recon_weight * recon_loss + speaker_weight * speaker_loss + duration_weight * duration_loss
                 loss = loss / grad_accum_steps
 
             loss.backward()
@@ -449,12 +458,14 @@ def train_stage4(
             total_loss += loss.item() * grad_accum_steps
             total_recon += recon_loss.item()
             total_speaker += speaker_loss.item()
+            total_duration += duration_loss.item()
             num_batches += 1
 
             pbar.set_postfix(
                 loss=f"{loss.item() * grad_accum_steps:.4f}",
                 recon=f"{recon_loss.item():.4f}",
                 spk=f"{speaker_loss.item():.4f}",
+                dur=f"{duration_loss.item():.4f}",
             )
 
         # Flush remaining gradients
@@ -469,7 +480,8 @@ def train_stage4(
         avg_loss = total_loss / num_batches
         avg_recon = total_recon / num_batches
         avg_speaker = total_speaker / num_batches
-        print(f"  Epoch {epoch+1}: loss={avg_loss:.4f} (recon={avg_recon:.4f}, spk={avg_speaker:.4f})")
+        avg_duration = total_duration / num_batches
+        print(f"  Epoch {epoch+1}: loss={avg_loss:.4f} (recon={avg_recon:.4f}, spk={avg_speaker:.4f}, dur={avg_duration:.4f})")
 
         # Save best
         if avg_loss < best_loss:
