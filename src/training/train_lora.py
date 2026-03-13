@@ -118,7 +118,7 @@ from unsloth import FastLanguageModel
 
 
 # =============================================================================
-# Dataset format conversion — living agent JSONL → ChatML text with label masks
+# Dataset format conversion — living agent JSONL -> ChatML text with label masks
 # =============================================================================
 
 TOOL_RESULT_PATTERN = re.compile(r"<tool_result>.*?</tool_result>", re.DOTALL)
@@ -454,6 +454,16 @@ def main():
             print(f"    GPU {i}: {_name} ({_mem:.1f} GB)")
     model, tokenizer = FastLanguageModel.from_pretrained(**_load_kwargs)
 
+    # Qwen3.5 is a VL model — Unsloth may return a processor instead of tokenizer.
+    # Extract the actual tokenizer for encode/decode operations.
+    if hasattr(tokenizer, 'tokenizer'):
+        _processor = tokenizer
+        _inner_tokenizer = tokenizer.tokenizer
+        print(f"  Processor detected ({type(tokenizer).__name__}), using inner tokenizer")
+    else:
+        _processor = None
+        _inner_tokenizer = tokenizer
+
     # ─── Force SDPA on GQA attention layers ───
     _text_config = getattr(model.config, "text_config", model.config)
     _old_attn = getattr(_text_config, "_attn_implementation", None)
@@ -618,7 +628,7 @@ def main():
     # Convert living agent format to ChatML text
     print("Formatting with chat template...")
     dataset = dataset.map(
-        lambda ex: format_living_agent_to_chatml(ex, tokenizer),
+        lambda ex: format_living_agent_to_chatml(ex, _inner_tokenizer),
         remove_columns=dataset.column_names,
         num_proc=4,
         desc="Formatting",
@@ -706,12 +716,12 @@ def main():
                 if hasattr(module, "_gradient_checkpointing_func"):
                     module._gradient_checkpointing_func = _unsloth_ckpt
     PreTrainedModel._set_gradient_checkpointing = _patched_set_gc
-    print(f"  Gradient checkpointing: patched → Unsloth CPU offloading")
+    print(f"  Gradient checkpointing: patched -> Unsloth CPU offloading")
 
     # ─── Tool result masking ───
     tool_result_masker = None
     if args.mask_tool_results:
-        tool_result_masker = LivingAgentDataCollator(tokenizer)
+        tool_result_masker = LivingAgentDataCollator(_inner_tokenizer)
         print(f"  Tool result masking: ENABLED (loss computed only on model-generated tokens)")
 
         # Wrap the trainer's compute_loss to apply tool_result masking
@@ -823,7 +833,7 @@ def main():
             embed.register_forward_pre_hook(_embed_pre_hook)
             embed.register_forward_hook(_embed_post_hook)
             torch.cuda.empty_cache()
-            print(f"    embed_tokens → GPU 1")
+            print(f"    embed_tokens -> GPU 1")
 
     # Report memory
     if torch.cuda.is_available():
