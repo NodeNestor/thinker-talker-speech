@@ -123,6 +123,7 @@ class AgentRuntime:
         summarize_fn: Callable = None,  # async fn(text) -> str (base model, no LoRA)
         speak_fn: Callable = None,     # async fn(text, emotion, speed, energy) -> audio_bytes
         stream_speak_fn: Callable = None,  # async generator fn(text, emotion, ...) -> yields audio chunks
+        transcribe_fn: Callable = None,  # async fn(audio_bytes, sample_rate) -> str (STT)
     ):
         self.workspace = workspace
         self.conversation_id = conversation_id or str(uuid.uuid4())[:8]
@@ -137,6 +138,7 @@ class AgentRuntime:
         self._summarize = summarize_fn
         self._speak = speak_fn
         self._stream_speak = stream_speak_fn
+        self._transcribe = transcribe_fn
 
         # Conversation history
         self.messages: list[dict] = []

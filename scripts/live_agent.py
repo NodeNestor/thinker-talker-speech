@@ -38,6 +38,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.runtime.runtime import parse_speak_attrs
 from src.runtime.tools import ToolExecutor
+from src.model.emotion_probe import EmotionProbe
+from src.model.connector import EMOTION_TEMPERATURE
+from src.training.train_probe import HiddenStateCapture
 
 log = logging.getLogger("live_agent")
 
@@ -238,15 +241,15 @@ class TTSPipeline:
         self.player = player
         self._interrupted = threading.Event()
 
-    def _generate_audio(self, text: str) -> np.ndarray:
+    def _generate_audio(self, text: str, temperature: float = 0.8) -> np.ndarray:
         clean = re.sub(r'<(?!/?(?:laugh|chuckle|pause|sigh|gasp))[^>]+>', '', text).strip()
         if not clean:
             return None
-        wav = self.tts.generate(clean)
+        wav = self.tts.generate(clean, temperature=temperature)
         audio = wav.squeeze().cpu().numpy()
         return audio[0] if audio.ndim > 1 else audio
 
-    def speak(self, text: str):
+    def speak(self, text: str, temperature: float = 0.8):
         """Speak text with sentence-level pipelining. Can be interrupted."""
         self._interrupted.clear()
 
@@ -265,7 +268,7 @@ class TTSPipeline:
             return
 
         # Pipeline: generate first, then overlap play+generate
-        current_audio = self._generate_audio(merged[0])
+        current_audio = self._generate_audio(merged[0], temperature=temperature)
 
         for i in range(len(merged)):
             if self._interrupted.is_set():
@@ -273,7 +276,7 @@ class TTSPipeline:
 
             if current_audio is None:
                 if i + 1 < len(merged):
-                    current_audio = self._generate_audio(merged[i + 1])
+                    current_audio = self._generate_audio(merged[i + 1], temperature=temperature)
                 continue
 
             if i + 1 < len(merged):
@@ -287,7 +290,7 @@ class TTSPipeline:
 
                 # Generate next while playing
                 if not self._interrupted.is_set():
-                    next_audio = self._generate_audio(merged[i + 1])
+                    next_audio = self._generate_audio(merged[i + 1], temperature=temperature)
                 else:
                     self.player.stop()
                     return
@@ -399,12 +402,16 @@ class LiveAgent:
     """Fully async living agent with concurrent listening/thinking/speaking."""
 
     def __init__(self, thinker, tokenizer, whisper_model=None,
-                 tts_model=None, workspace=".", text_mode=False, no_tts=False):
+                 tts_model=None, workspace=".", text_mode=False, no_tts=False,
+                 probe=None, capture=None):
         self.thinker = thinker
         self.tokenizer = tokenizer
         self.whisper = whisper_model
         self.text_mode = text_mode
         self.no_tts = no_tts
+        self.probe = probe
+        self.capture = capture
+        self._current_emotion = "neutral"
 
         # Tools & memory
         self.tools = ToolExecutor(workspace=workspace)
@@ -472,6 +479,25 @@ class LiveAgent:
         self.messages.append({"role": "user", "content": user_text})
         self._trim_history()
 
+        # Run emotion probe on user input (once per user turn)
+        if self.probe is not None and self.capture is not None:
+            try:
+                self.capture.clear()
+                probe_inputs = self.tokenizer(
+                    user_text, return_tensors="pt"
+                ).to(self.thinker.device)
+                with torch.no_grad():
+                    self.thinker(**probe_inputs)
+                # Cast captured states to float32 for the probe
+                delta_states = {k: v.float() for k, v in self.capture.deltanet_states.items()}
+                attn_states = {k: v.float() for k, v in self.capture.attention_states.items()}
+                probe_out = self.probe(delta_states, attn_states)
+                self._current_emotion = probe_out.get("emotion_label", "neutral") or "neutral"
+                print(f"  \033[95m[emotion: {self._current_emotion}]\033[0m")
+            except Exception as e:
+                log.warning(f"Emotion probe failed: {e}")
+                self._current_emotion = "neutral"
+
         raw_parts = []
 
         for iteration in range(5):  # Max tool call chains
@@ -520,14 +546,16 @@ class LiveAgent:
                         text = block["text"]
                         emotion = block.get("emotion", "neutral")
                         raw_parts.append(f'<speak emotion="{emotion}">{text}</speak>')
+                        print(f"  [{self._current_emotion}] speaking: \"{text[:50]}...\"")
 
                         # Start TTS in background thread immediately!
                         # This runs while the model may still be generating more tokens
                         if self.tts_pipe and not self.no_tts:
                             self._speaking = True
+                            temperature = EMOTION_TEMPERATURE.get(self._current_emotion, 0.8)
                             speak_thread = threading.Thread(
                                 target=self._speak_and_clear,
-                                args=(text,),
+                                args=(text, temperature),
                                 daemon=True,
                             )
                             speak_thread.start()
@@ -582,12 +610,14 @@ class LiveAgent:
                 has_speak = any(b["type"] == "speak" for b in blocks)
                 if not has_speak:
                     print(f"  \033[96m[speak]\033[0m {leftover}")
+                    print(f"  [{self._current_emotion}] speaking: \"{leftover[:50]}...\"")
                     raw_parts.append(f'<speak emotion="neutral">{leftover}</speak>')
                     if self.tts_pipe and not self.no_tts:
                         self._speaking = True
+                        temperature = EMOTION_TEMPERATURE.get(self._current_emotion, 0.8)
                         t = threading.Thread(
                             target=self._speak_and_clear,
-                            args=(leftover,), daemon=True)
+                            args=(leftover, temperature), daemon=True)
                         t.start()
 
             if not needs_continuation:
@@ -600,10 +630,10 @@ class LiveAgent:
         # Wait for any remaining TTS to finish
         self._wait_for_speech()
 
-    def _speak_and_clear(self, text: str):
+    def _speak_and_clear(self, text: str, temperature: float = 0.8):
         """Speak text and clear the speaking flag when done."""
         try:
-            self.tts_pipe.speak(text)
+            self.tts_pipe.speak(text, temperature=temperature)
         finally:
             self._speaking = False
 
@@ -725,6 +755,21 @@ def main():
     whisper_model = load_whisper(device=args.device) if not args.text else None
     tts_model = load_chatterbox(device=args.device) if not args.no_tts else None
 
+    # Load emotion probe
+    probe = None
+    capture = None
+    probe_path = os.path.join(os.path.dirname(__file__), "..", "checkpoints", "probe", "probe_best.pt")
+    if os.path.exists(probe_path):
+        print("Loading Emotion Probe...")
+        t0 = time.time()
+        probe = EmotionProbe(hidden_size=1024)
+        probe.load_state_dict(torch.load(probe_path, map_location=args.device, weights_only=True))
+        probe = probe.to(args.device).eval()
+        capture = HiddenStateCapture(thinker)
+        print(f"  Loaded in {time.time() - t0:.1f}s")
+    else:
+        print(f"  Emotion probe not found at {probe_path}, running without emotion detection")
+
     if args.device == "cuda":
         print(f"\nVRAM used: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
 
@@ -732,6 +777,7 @@ def main():
         thinker=thinker, tokenizer=tokenizer,
         whisper_model=whisper_model, tts_model=tts_model,
         workspace=args.workspace, text_mode=args.text, no_tts=args.no_tts,
+        probe=probe, capture=capture,
     )
     agent.run()
 
