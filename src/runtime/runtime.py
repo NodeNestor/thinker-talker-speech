@@ -122,6 +122,7 @@ class AgentRuntime:
         generate_fn: Callable = None,  # async fn(messages, **kwargs) -> str
         summarize_fn: Callable = None,  # async fn(text) -> str (base model, no LoRA)
         speak_fn: Callable = None,     # async fn(text, emotion, speed, energy) -> audio_bytes
+        stream_speak_fn: Callable = None,  # async generator fn(text, emotion, ...) -> yields audio chunks
     ):
         self.workspace = workspace
         self.conversation_id = conversation_id or str(uuid.uuid4())[:8]
@@ -135,6 +136,7 @@ class AgentRuntime:
         self._generate = generate_fn
         self._summarize = summarize_fn
         self._speak = speak_fn
+        self._stream_speak = stream_speak_fn
 
         # Conversation history
         self.messages: list[dict] = []
@@ -145,6 +147,7 @@ class AgentRuntime:
 
         # Callbacks
         self._on_speak: list[Callable] = []  # (text, emotion, audio_bytes) -> None
+        self._on_audio_chunk: list[Callable] = []  # (audio_chunk) -> None (streaming)
         self._on_state_change: list[Callable] = []
 
         # Wire up state machine listener
@@ -153,6 +156,10 @@ class AgentRuntime:
     def on_speak(self, callback: Callable):
         """Register callback for when agent speaks. Gets (text, emotion, audio)."""
         self._on_speak.append(callback)
+
+    def on_audio_chunk(self, callback: Callable):
+        """Register callback for streaming audio chunks. Gets (AudioChunk)."""
+        self._on_audio_chunk.append(callback)
 
     async def start(self):
         """Start the runtime event loop."""
@@ -275,15 +282,32 @@ class AgentRuntime:
                     self.state.transition(AgentState.SPEAKING)
                     all_blocks.append(block)
 
-                    # Actually speak if we have a TTS function
-                    if self._speak:
+                    # Streaming TTS — yields audio chunks as they're generated
+                    if self._stream_speak and self._on_audio_chunk:
+                        async for chunk in self._stream_speak(
+                            block["text"], block["emotion"],
+                            block["speed"], block["energy"],
+                        ):
+                            # Check for interruption mid-speech
+                            if self.state.check_interrupt():
+                                all_blocks.append({"type": "interrupted"})
+                                return all_blocks
+
+                            for cb in self._on_audio_chunk:
+                                try:
+                                    await cb(chunk)
+                                except Exception as e:
+                                    log.error(f"Audio chunk callback error: {e}")
+
+                    # Fallback: non-streaming TTS
+                    elif self._speak:
                         audio = await self._speak(
                             block["text"], block["emotion"],
                             block["speed"], block["energy"],
                         )
                         block["audio"] = audio
 
-                    # Notify listeners
+                    # Notify speak-complete listeners
                     for cb in self._on_speak:
                         try:
                             await cb(block["text"], block["emotion"], block.get("audio"))
