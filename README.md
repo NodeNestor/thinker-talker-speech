@@ -1,14 +1,14 @@
 # Thinker-Talker Speech
 
-End-to-end speech agent: Qwen 3.5 0.8B Thinker + Chatterbox Turbo 350M Talker with emotion-aware streaming TTS.
+End-to-end speech agent: Qwen 3.5 0.8B Thinker + Chatterbox Turbo 350M Talker with emotion-aware streaming TTS. Thinks, speaks, uses tools, and listens — all in real-time on ~5 GB VRAM.
 
 ## Architecture
 
 ```
 [Mic] -> faster-whisper STT (text for display + history)
-      -> WhisperAdapter (audio → Thinker embeddings, preserves tone/prosody)
+      -> WhisperAdapter (audio -> Thinker embeddings, preserves tone/prosody)
       -> Qwen 3.5 0.8B Thinker (LoRA, streaming via TextIteratorStreamer)
-          |-- tool_call? -> intercept, execute, feed back
+          |-- <tool_call>? -> intercept, execute, feed result back
           |-- hidden states -> Dual Emotion Probe:
           |     DeltaNet states (18 layers) -> mood/energy/pace
           |     Attention layers (6 layers) -> emphasis/surprise
@@ -43,130 +43,6 @@ Time    Thinker                          TTS
 
 First audio in ~0.3s instead of ~1.5s without overlap.
 
-## Live Agent
-
-The live agent runs with concurrent mic listening, thinking, and speaking:
-
-```bash
-# Full voice mode (mic + TTS) — basic generation
-CUDA_VISIBLE_DEVICES=1 python scripts/live_agent.py
-
-# Streaming TTS with reference voice (clause-level, speech-token streaming)
-CUDA_VISIBLE_DEVICES=1 python scripts/live_agent.py --voice data/reference_speakers/voice.wav
-
-# Keyboard input, voice output
-CUDA_VISIBLE_DEVICES=1 python scripts/live_agent.py --text --voice voice.wav
-
-# Pure text mode
-CUDA_VISIBLE_DEVICES=1 python scripts/live_agent.py --text --no-tts
-```
-
-Features:
-- Always-on mic with VAD (voice activity detection)
-- User speech interrupts agent mid-sentence
-- **WhisperAdapter**: audio features fed directly to Thinker (preserves tone/prosody beyond text)
-- **Emotion Probe**: detects emotion from hidden states, adjusts TTS style
-- **Streaming TTS** with `--voice`: clause-level splitting + speech-token streaming (~0.3s first audio)
-- **HiddenStateConnector**: when trained, bypasses text decoding for richer speech (auto-detected)
-- Tool calling (file ops, git, web search, memory, timers)
-- Streaming token display (thinking in gray, speech in white)
-
-## Training Pipeline
-
-### Stage 1: Whisper Adapter
-
-Maps Whisper encoder features into Thinker embedding space. In inference, when mic input is captured, audio features are fed directly to the Thinker via `inputs_embeds` — preserving tone, emphasis, and prosody that text transcription loses. Faster-whisper STT still runs in parallel for text display and conversation history.
-
-```bash
-python -m src.training.train_stage1 --lora-path checkpoints/living-agent/lora
-```
-
-**Result**: Loss 0.52 -> **0.17** (cosine similarity ~0.83)
-
-### Stage 2: Thinker LoRA
-
-Standard LoRA finetuning on VoiceAssistant-400K for speech instruction following.
-
-### Stage 3: Emotion Probe
-
-Trains a ~2M param probe to read emotion and prosody from the Thinker's frozen hidden states.
-
-**Architecture**: `HiddenStateCapture` registers forward hooks on all 24 Qwen 3.5 layers. DeltaNet layers (18) feed a `DeltaNetProbe` and attention layers (6) feed an `AttentionProbe`. Both produce a 14-dim conditioning vector (10 emotions + 4 prosody floats).
-
-**Similarity-weighted soft labels**: Confusing similar emotions costs less than dissimilar ones. Groups: positive (happy/excited/calm), negative (sad/fearful/disgusted), hostile (angry), reactive (surprised/confused).
-
-```bash
-python -m src.training.train_probe --lora-path checkpoints/living-agent/lora --epochs 15
-```
-
-**Result**: 50.4% accuracy (10-class, soft labels)
-
-### Stage 4: HiddenStateConnector
-
-Trains the HiddenStateConnector (~2M params) to project Thinker hidden states directly into T3's text embedding space. This bypasses text decoding entirely — the Thinker's internal representation (which encodes emotion, emphasis, prosody) is projected straight into the TTS model's input space.
-
-Uses FiLM conditioning from the emotion probe + cross-attention for sequence alignment between different tokenizers.
-
-```bash
-python -m src.training.train_stage4 --lora-path checkpoints/living-agent/lora --probe-ckpt checkpoints/probe/probe_best.pt
-```
-
-**Result**: Loss 5.10 -> **0.090** (cosine similarity ~82%)
-
-When trained, the connector activates automatically in `live_agent.py`. Falls back to text → T3 tokenizer path if checkpoint doesn't exist.
-
-## Validation
-
-Comprehensive stack validation — tests every component individually and end-to-end:
-
-```bash
-# Full validation (all components)
-CUDA_VISIBLE_DEVICES=1 python scripts/validate_stack.py
-
-# Individual components
-CUDA_VISIBLE_DEVICES=1 python scripts/validate_stack.py --component thinker
-CUDA_VISIBLE_DEVICES=1 python scripts/validate_stack.py --component probe
-CUDA_VISIBLE_DEVICES=1 python scripts/validate_stack.py --component tts
-CUDA_VISIBLE_DEVICES=1 python scripts/validate_stack.py --component loop  # full TTS→STT roundtrip
-```
-
-The loop test validates end-to-end: generates "user speech" with TTS → transcribes with Whisper → feeds to Thinker → speaks response → verifies with Whisper.
-
-## Streaming Test
-
-Compare overlapped vs non-overlapped streaming:
-
-```bash
-CUDA_VISIBLE_DEVICES=1 python scripts/test_overlapped.py --compare
-```
-
-## Run All Stages
-
-```bash
-CUDA_VISIBLE_DEVICES=1 bash scripts/train_all_stages.sh
-```
-
-## Components
-
-| Component | Size | Training? | Checkpoint |
-|-----------|------|-----------|------------|
-| Whisper-small encoder | 244M | Frozen | HuggingFace |
-| CNN Adapter (Whisper→Thinker) | ~2M | Stage 1 | `checkpoints/adapter/` |
-| Qwen 3.5 0.8B Thinker | 0.8B | LoRA (~16M) | `checkpoints/living-agent/lora/` |
-| Emotion/Prosody Probe | ~2M | Stage 3 | `checkpoints/probe/` |
-| HiddenStateConnector (Thinker→T3) | ~2M | Stage 4 | `checkpoints/connector/` |
-| Rule-based style fallback | 0 | No | N/A |
-| Chatterbox Turbo Talker | 350M | Frozen | HuggingFace |
-
-## Datasets
-
-| Stage | Dataset | Size | Purpose |
-|-------|---------|------|---------|
-| 1 | LibriSpeech clean-100 | 100h | Whisper adapter alignment |
-| 2 | VoiceAssistant-400K | 400K pairs | Thinker LoRA finetuning |
-| 3 | GoEmotions | 58K texts | Emotion probe training |
-| 4 | GoEmotions + probe | reused | HiddenStateConnector alignment |
-
 ## Demo: AI-to-AI Conversation (End-to-End)
 
 Every audio sample below was generated entirely by AI — no human voice involved. The pipeline generates synthetic "user speech" with TTS, transcribes it with Whisper, feeds it to the Thinker, speaks the response with Chatterbox Turbo, and verifies intelligibility with Whisper. 10/10 validation tests passed.
@@ -183,8 +59,8 @@ Every audio sample below was generated entirely by AI — no human voice involve
 
 **Thinker processes** — reads emotion from hidden states, detects `empathetic` mood:
 ```
-[emotion probe] → confused/empathetic (conditioning_vector: 14-dim)
-[hidden states]  → HiddenStateConnector → T3 text embeddings (bypasses text decoding)
+[emotion probe] -> confused/empathetic (conditioning_vector: 14-dim)
+[hidden states]  -> HiddenStateConnector -> T3 text embeddings (bypasses text decoding)
 ```
 
 **Agent responds** (16.2s of streaming speech, 89% intelligibility):
@@ -206,7 +82,7 @@ Every audio sample below was generated entirely by AI — no human voice involve
 **Thinker processes** — thinks internally, then speaks:
 ```
 <thinking>Oh, let me think about something... I can imagine...</thinking>
-[streaming TTS] → clause-level splitting → vocode every 50 speech tokens → audio chunks
+[streaming TTS] -> clause-level splitting -> vocode every 50 speech tokens -> audio chunks
 ```
 
 **Agent responds** (21.8s of streaming speech, 76% intelligibility):
@@ -217,7 +93,159 @@ Every audio sample below was generated entirely by AI — no human voice involve
 
 ---
 
-Full pipeline: Mic/TTS → Whisper STT → WhisperAdapter → Thinker (0.8B) → Emotion Probe → HiddenStateConnector → T3 → Vocode → Speaker. Total VRAM: **~4.8 GB**.
+Full pipeline: Mic/TTS -> Whisper STT -> WhisperAdapter -> Thinker (0.8B) -> Emotion Probe -> HiddenStateConnector -> T3 -> Vocode -> Speaker. Total VRAM: **~4.8 GB**.
+
+## Live Agent
+
+The live agent runs three concurrent threads — mic listening, thinking, and speaking:
+
+```bash
+# Full voice mode (mic + TTS)
+CUDA_VISIBLE_DEVICES=1 python scripts/live_agent.py
+
+# Streaming TTS with reference voice (clause-level, speech-token streaming)
+CUDA_VISIBLE_DEVICES=1 python scripts/live_agent.py --voice data/reference_speakers/voice.wav
+
+# Keyboard input, voice output
+CUDA_VISIBLE_DEVICES=1 python scripts/live_agent.py --text --voice voice.wav
+
+# Pure text mode
+CUDA_VISIBLE_DEVICES=1 python scripts/live_agent.py --text --no-tts
+```
+
+Features:
+- Always-on mic with VAD (voice activity detection)
+- User speech interrupts agent mid-sentence
+- **WhisperAdapter**: audio features fed directly to Thinker (preserves tone/prosody beyond text)
+- **Emotion Probe**: detects emotion from hidden states, adjusts TTS style in real-time
+- **Streaming TTS** with `--voice`: clause-level splitting + speech-token streaming (~0.3s first audio)
+- **HiddenStateConnector**: when trained, bypasses text decoding for richer speech (auto-detected)
+- **Tool calling**: file ops, git, web search, memory, timers, terminal (40+ tools)
+- **Memory**: KnowledgeGraph (SQLite + embeddings) + RollingContext (content-hash compression)
+- **State machine**: 7 states (idle, listening, thinking, speaking, tool_using, working, background) with interrupt handling
+- Streaming token display (thinking in gray, speech in white, tools in yellow)
+
+## Data Generation Pipeline
+
+Training data is **generated within the project**, not just downloaded. External datasets are used as source fragments that get stitched into rich, multi-turn living agent conversations.
+
+### Source Datasets
+
+Downloaded via `scripts/download_data.py` and converted to a unified turn format by `src/data/dataset_sources.py`:
+
+| Source | Type | Used For |
+|--------|------|----------|
+| LibriSpeech clean-100 | 100h speech + transcripts | Stage 1: Whisper Adapter alignment |
+| OS-World | Computer use (click, type, scroll) | Stage 2: Tool use fragments |
+| GUI-Odyssey | Cross-app GUI navigation | Stage 2: Computer use fragments |
+| ScreenSpot | UI element grounding | Stage 2: Vision fragments |
+| Mind2Web | Web browsing (click, type, select) | Stage 2: Web browsing fragments |
+| WildChat | 1M natural conversations | Stage 2: Conversation fragments |
+| ToolBench | Multi-step API tool chains | Stage 2: Tool chain fragments |
+| Claude Code traces | Real Claude Code JSONL logs | Stage 2: Real tool use examples |
+| GoEmotions | 58K texts, 28 emotion labels | Stages 3 & 4: Emotion training |
+
+### Hybrid Mixer (Stage 2 Data)
+
+`src/data/hybrid_mixer.py` generates living agent training data by stitching **real fragments** from the source datasets above into coherent 50-100+ turn conversations:
+
+1. Pick random scenario domain (file management, web browsing, troubleshooting, casual, etc.)
+2. Pick scenario type with weighted sampling:
+   - tool_use_conversation (25%), interruption_mid_speech (15%), memory_store_recall (12%), multi_tool_chain (8%), pure_speech (10%), emotional_shift (5%), error_recovery (5%), etc.
+3. Randomize: user personality, time of day, interruption triggers (40% chance), autonomous triggers (25% chance)
+4. Pull 5-20 real fragments from source datasets
+5. Call LLM to stitch fragments into a coherent conversation with:
+   - `<speak emotion="..." speed="..." energy="...">` blocks with speech tags (`[laugh]`, `[sigh]`, `[pause]`)
+   - `<think>` internal reasoning blocks
+   - `<tool_call>` / `<tool_result>` blocks (40+ tools defined in `src/data/environment.py`)
+   - `<interrupted/>` tags (user interrupts agent mid-speech)
+6. Post-process: fix unclosed XML, invalid emotions, malformed JSON, merge consecutive turns
+7. Validate: turn count, role alternation, valid speak/tool_call/think blocks, emotion/prosody ranges
+
+Output: `data/hybrid_living_agent.jsonl` — each sample is a 50-100+ turn conversation with speech, emotion, tools, thinking, and interruptions.
+
+### Synthetic Conversation Generator
+
+`src/data/generate_synthetic.py` is a lighter alternative that generates conversations from 13 seed scenarios with randomized world state (project context, user mood, screen contents, knowledge graph state, rolling context recalls).
+
+### Environment Definition
+
+`src/data/environment.py` defines the agent's world: 40+ tools across 8 categories (computer use, file management, terminal, memory, vision, web, system, media), 7 agent states, interruption rules, and autonomous behaviors.
+
+## Training Pipeline
+
+### Stage 1: Whisper Adapter
+
+Maps Whisper encoder features into Thinker embedding space. In inference, audio features are fed directly to the Thinker via `inputs_embeds` — preserving tone, emphasis, and prosody that text transcription loses. Faster-whisper STT still runs in parallel for text display and conversation history.
+
+```bash
+python -m src.training.train_stage1 --lora-path checkpoints/living-agent/lora
+```
+
+**Data**: LibriSpeech clean-100 (100h speech + transcripts)
+**Loss**: Cosine similarity + KL divergence on next-token predictions
+**Trainable**: Adapter only (~2M params), Whisper + Thinker frozen
+**Result**: Loss 0.52 -> **0.17** (cosine similarity ~0.83)
+
+### Stage 2: Thinker LoRA
+
+LoRA finetuning on generated living agent conversation data. The model learns to think (`<think>`), speak with emotion (`<speak emotion="...">`), call tools (`<tool_call>`), handle interruptions, and manage memory — all from the hybrid-generated dataset.
+
+```bash
+python -m src.training.train_lora --dataset data/hybrid_living_agent.jsonl
+```
+
+**Data**: Generated via hybrid mixer (real fragments from 7+ source datasets stitched by LLM into multi-turn conversations)
+**LoRA Config**: rank=32, alpha=64, DoRA enabled, ~16M trainable params
+**Features**: Label masking on `<tool_result>` blocks (only train on model-generated tokens), Cut Cross Entropy for fast loss computation
+**Optimizations**: Unsloth 4-bit quantization, SDPA attention, gradient accumulation
+
+### Stage 3: Emotion Probe
+
+Trains a ~2M param dual probe to read emotion and prosody from the Thinker's frozen hidden states.
+
+**Architecture**: `HiddenStateCapture` registers forward hooks on all 24 Qwen 3.5 layers. DeltaNet layers (18) feed a `DeltaNetProbe` (slow context: overall mood, energy) and attention layers (6) feed an `AttentionProbe` (fast context: per-token emphasis, surprise). Combined output: 14-dim conditioning vector (10 emotions + 4 prosody floats: speed, pitch, energy, emphasis).
+
+**Similarity-weighted soft labels**: Confusing similar emotions costs less than dissimilar ones. Groups: positive (happy/excited/calm), negative (sad/fearful/disgusted), hostile (angry), reactive (surprised/confused).
+
+```bash
+python -m src.training.train_probe --lora-path checkpoints/living-agent/lora --epochs 15
+```
+
+**Data**: GoEmotions (58K texts, 28 emotions mapped to 10)
+**Result**: 50.4% accuracy (10-class, soft labels)
+
+### Stage 4: HiddenStateConnector
+
+Trains the HiddenStateConnector (~2M params) to project Thinker hidden states directly into T3's text embedding space. This bypasses text decoding entirely — the Thinker's internal representation (which encodes emotion, emphasis, prosody) is projected straight into the TTS model's input space.
+
+Uses FiLM conditioning from the emotion probe + cross-attention for sequence alignment between different tokenizers.
+
+```bash
+python -m src.training.train_stage4 --lora-path checkpoints/living-agent/lora --probe-ckpt checkpoints/probe/probe_best.pt
+```
+
+**Data**: GoEmotions (text alignment) + synthetic connector data (generated by `src/training/generate_connector_data.py` — Thinker generates diverse emotional text, Chatterbox synthesizes speech with random reference speakers)
+**Result**: Loss 5.10 -> **0.090** (cosine similarity ~82%)
+
+When trained, the connector activates automatically in `live_agent.py`. Falls back to text -> T3 tokenizer path if checkpoint doesn't exist.
+
+## Validation
+
+Comprehensive stack validation — tests every component individually and end-to-end:
+
+```bash
+# Full validation (all components)
+CUDA_VISIBLE_DEVICES=1 python scripts/validate_stack.py
+
+# Individual components
+CUDA_VISIBLE_DEVICES=1 python scripts/validate_stack.py --component thinker
+CUDA_VISIBLE_DEVICES=1 python scripts/validate_stack.py --component probe
+CUDA_VISIBLE_DEVICES=1 python scripts/validate_stack.py --component tts
+CUDA_VISIBLE_DEVICES=1 python scripts/validate_stack.py --component loop  # full TTS->STT roundtrip
+```
+
+The loop test validates end-to-end: generates "user speech" with TTS -> transcribes with Whisper -> feeds to Thinker -> speaks response -> verifies with Whisper.
 
 ### Full Loop Test
 
@@ -233,6 +261,40 @@ Compare first-audio latency with and without pipelining:
 CUDA_VISIBLE_DEVICES=1 python scripts/test_overlapped.py --compare --voice voice.wav
 ```
 
+## Run All Stages
+
+```bash
+# Generate training data first
+python scripts/download_data.py
+
+# Train all stages sequentially
+CUDA_VISIBLE_DEVICES=1 bash scripts/train_all_stages.sh
+```
+
+## Components
+
+| Component | Size | Training | Checkpoint |
+|-----------|------|----------|------------|
+| Whisper-small encoder | 244M | Frozen | HuggingFace |
+| WhisperAdapter (Whisper->Thinker) | ~2M | Stage 1 | `checkpoints/adapter/` |
+| Qwen 3.5 0.8B Thinker | 0.8B | LoRA (~16M, DoRA) | `checkpoints/living-agent/lora/` |
+| Emotion/Prosody Probe (dual) | ~2M | Stage 3 | `checkpoints/probe/` |
+| HiddenStateConnector (Thinker->T3) | ~2M | Stage 4 | `checkpoints/connector/` |
+| StyleMapper (emotion->TTS params) | ~10K | Optional | Fallback: rule-based |
+| Speaker Encoder (ECAPA-TDNN) | 7M | Frozen | `models/ecapa-tdnn/` |
+| Chatterbox Turbo Talker | 350M | Frozen | HuggingFace |
+
+Total new trainable params: ~23M across all stages. Runtime VRAM: ~4.8 GB.
+
+## Runtime Components
+
+| Module | Purpose |
+|--------|---------|
+| `src/runtime/runtime.py` | Main event loop — parse blocks, route, update memory |
+| `src/runtime/tools.py` | ToolExecutor — 40+ tools (file ops, git, web, terminal, vision, memory) |
+| `src/runtime/memory.py` | KnowledgeGraph (SQLite + embeddings) + RollingContext (content-hash compression) |
+| `src/runtime/state_machine.py` | 7 agent states with interrupt handling and transition rules |
+
 ## Quick Start
 
 ```bash
@@ -244,11 +306,11 @@ pip install -r requirements.txt
 # 2. Download pre-trained components
 python scripts/download_models.py
 
-# 3. Download training data
+# 3. Download source datasets + generate training data
 python scripts/download_data.py
 
-# 4. Train (picks GPU automatically)
-LORA_PATH=checkpoints/living-agent/lora bash scripts/train_all_stages.sh
+# 4. Train (all 4 stages sequentially)
+CUDA_VISIBLE_DEVICES=1 bash scripts/train_all_stages.sh
 
 # 5. Validate everything works
 CUDA_VISIBLE_DEVICES=1 python scripts/validate_stack.py --voice data/reference_speakers/voice.wav
@@ -266,6 +328,6 @@ CUDA_VISIBLE_DEVICES=1 python scripts/live_agent.py --voice data/reference_speak
 
 ### Platform Notes
 
-- **Windows**: `torchaudio.save` requires TorchCodec — pipeline uses `soundfile` instead
+- **Windows**: `torchaudio.save` requires TorchCodec — pipeline uses `soundfile` instead. Whisper audio loading bypasses ffmpeg via `soundfile` + `librosa`.
 - **WSL**: Recommended for training — supports Flash Attention (2-3x faster)
 - **CUDA devices**: `CUDA_VISIBLE_DEVICES=0` = RTX 4060 (8GB), `CUDA_VISIBLE_DEVICES=1` = RTX 5060 Ti (16GB)
