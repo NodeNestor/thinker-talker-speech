@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live Agent Loop — fully async pipeline.
+"""Live Agent Loop -- fully async pipeline.
 
 Architecture:
   [Mic Thread]  --audio-->  [STT]  --text-->  [Input Queue]
@@ -59,13 +59,13 @@ Guidelines:
 - Always think before acting or speaking
 - Use tools to interact with the computer
 - Speak naturally with appropriate emotions (happy, excited, concerned, thoughtful, neutral)
-- Keep spoken responses concise — you're talking, not writing an essay
+- Keep spoken responses concise -- you're talking, not writing an essay
 - Use paralinguistic tags in speech: [laugh], [chuckle], [pause], [sigh]
 - If a tool call fails, explain what happened and try an alternative
 - ALWAYS wrap spoken text in <speak> tags"""
 
 
-# ── Model loading ───────────────────────────────────────────────────
+# -- Model loading ---------------------------------------------------
 
 def load_thinker(lora_path: str, device: str = "cuda"):
     """Load Qwen 3.5 0.8B with LoRA via Unsloth (4-bit, same as training)."""
@@ -93,7 +93,7 @@ def load_thinker(lora_path: str, device: str = "cuda"):
 
 
 def load_whisper(device: str = "cuda"):
-    """Load faster-whisper (CTranslate2) — 4-6x faster than OpenAI whisper."""
+    """Load faster-whisper (CTranslate2) -- 4-6x faster than OpenAI whisper."""
     print("Loading faster-whisper (STT)...")
     t0 = time.time()
     from faster_whisper import WhisperModel
@@ -114,7 +114,7 @@ def load_chatterbox(device: str = "cuda"):
 
 
 def load_adapter(ckpt_path: str, device: str = "cuda"):
-    """Load trained WhisperAdapter (Whisper encoder → Thinker embedding space)."""
+    """Load trained WhisperAdapter (Whisper encoder -> Thinker embedding space)."""
     print("Loading WhisperAdapter...")
     t0 = time.time()
     adapter = WhisperAdapter(thinker_hidden_size=1024, device=device)
@@ -124,11 +124,11 @@ def load_adapter(ckpt_path: str, device: str = "cuda"):
     adapter = adapter.to(device).eval()
     for p in adapter.parameters():
         p.requires_grad = False
-    print(f"  Loaded in {time.time() - t0:.1f}s (audio → Thinker embedding space)")
+    print(f"  Loaded in {time.time() - t0:.1f}s (audio -> Thinker embedding space)")
     return adapter
 
 
-# ── Audio I/O ───────────────────────────────────────────────────────
+# -- Audio I/O -------------------------------------------------------
 
 class AudioPlayer:
     """Non-blocking audio player that can be interrupted."""
@@ -248,7 +248,7 @@ def transcribe(whisper_model, audio: np.ndarray, sr: int = 16000) -> str:
     return " ".join(seg.text.strip() for seg in segments).strip()
 
 
-# ── TTS Pipeline ────────────────────────────────────────────────────
+# -- TTS Pipeline ----------------------------------------------------
 
 class TTSPipeline:
     """TTS with streaming audio generation and clause-level pipelining.
@@ -373,7 +373,7 @@ class TTSPipeline:
         self.player.stop()
 
 
-# ── Streaming LLM Generation ───────────────────────────────────────
+# -- Streaming LLM Generation ---------------------------------------
 
 def stream_generate(model, tokenizer, messages, max_new_tokens=2048,
                     interrupt_event=None):
@@ -453,7 +453,7 @@ def stream_generate_with_audio(model, tokenizer, messages, audio_embeds,
 
     before_text, after_text = full_text.split(placeholder)
 
-    # Tokenize the text parts (without adding special tokens — template has them)
+    # Tokenize the text parts (without adding special tokens -- template has them)
     before_ids = tokenizer(before_text, return_tensors="pt",
                            add_special_tokens=False).input_ids.to(model.device)
     after_ids = tokenizer(after_text, return_tensors="pt",
@@ -464,7 +464,7 @@ def stream_generate_with_audio(model, tokenizer, messages, audio_embeds,
     before_emb = embed_layer(before_ids)   # [1, prefix_len, dim]
     after_emb = embed_layer(after_ids)     # [1, suffix_len, dim]
 
-    # audio_embeds: [1, audio_frames, dim] — from WhisperAdapter
+    # audio_embeds: [1, audio_frames, dim] -- from WhisperAdapter
     # Match dtype
     audio_embeds = audio_embeds.to(dtype=before_emb.dtype)
 
@@ -545,7 +545,7 @@ def extract_blocks(text: str) -> list[dict]:
     return blocks
 
 
-# ── The Living Agent ────────────────────────────────────────────────
+# -- The Living Agent ------------------------------------------------
 
 class LiveAgent:
     """Fully async living agent with concurrent listening/thinking/speaking."""
@@ -576,7 +576,7 @@ class LiveAgent:
         self.tts_pipe = TTSPipeline(tts_model, self.player, voice_path=voice_path) if tts_model else None
         self.mic = MicListener() if not text_mode else None
 
-        # Direct hidden state → speech path (when connector + voice available)
+        # Direct hidden state -> speech path (when connector + voice available)
         self.tts_connector = None
         if connector is not None and tts_model is not None and voice_path is not None:
             self.tts_connector = ThinkerTalkerConnector(
@@ -585,7 +585,7 @@ class LiveAgent:
                 hidden_connector=connector,
             )
             self.tts_connector._tts = tts_model  # Reuse loaded TTS (no double-load)
-            print(f"  \033[92mDirect hidden state → speech path enabled\033[0m")
+            print(f"  \033[92mDirect hidden state -> speech path enabled\033[0m")
 
         # Queues for async pipeline
         self.input_queue = queue.Queue()    # User text input
@@ -601,7 +601,7 @@ class LiveAgent:
         if len(self.messages) > self.max_history:
             self.messages = [self.messages[0]] + self.messages[-(self.max_history - 1):]
 
-    # ── Mic listener thread ─────────────────────────────────────────
+    # -- Mic listener thread -----------------------------------------
 
     def _mic_loop(self):
         """Continuously listen for speech. Runs in its own thread."""
@@ -647,10 +647,10 @@ class LiveAgent:
                     print(f"\n  [mic error: {e}]")
                 time.sleep(0.5)
 
-    # ── Brain: process input → generate → route blocks ──────────────
+    # -- Brain: process input -> generate -> route blocks --------------
 
     def _process(self, user_text: str):
-        """Process one user input through the full think→tool→speak loop."""
+        """Process one user input through the full think->tool->speak loop."""
         self.messages.append({"role": "user", "content": user_text})
         self._trim_history()
 
@@ -694,7 +694,7 @@ class LiveAgent:
                     self.thinker, self.tokenizer, self.messages, audio_embeds,
                     interrupt_event=self.interrupt,
                 )
-                print("  \033[94m[adapter: audio → Thinker]\033[0m")
+                print("  \033[94m[adapter: audio -> Thinker]\033[0m")
             else:
                 gen_source = stream_generate(
                     self.thinker, self.tokenizer, self.messages,
@@ -821,8 +821,8 @@ class LiveAgent:
     def _speak_and_clear(self, text: str, temperature: float = 0.8):
         """Speak text and clear the speaking flag when done.
 
-        Uses hidden state → speech path when connector is available,
-        otherwise falls back to text → TTS path.
+        Uses hidden state -> speech path when connector is available,
+        otherwise falls back to text -> TTS path.
         """
         try:
             if self.tts_connector and self.probe and self.capture:
@@ -861,7 +861,7 @@ class LiveAgent:
             probe_out = self.probe(delta_f32, attn_f32)
             emotion_vector = probe_out.get("conditioning_vector")
 
-        # Generate audio via connector (hidden states → T3 embeddings → speech)
+        # Generate audio via connector (hidden states -> T3 embeddings -> speech)
         audio = self.tts_connector.generate_from_hidden(
             thinker_hidden=hidden,
             emotion_vector=emotion_vector,
@@ -875,7 +875,7 @@ class LiveAgent:
         while self._speaking:
             time.sleep(0.05)
 
-    # ── Main loop ───────────────────────────────────────────────────
+    # -- Main loop ---------------------------------------------------
 
     def run(self):
         """Run the agent. Mic, brain, and voice all run concurrently."""
@@ -888,7 +888,7 @@ class LiveAgent:
             print("  Input:  keyboard")
         else:
             print("  Input:  microphone (always listening)")
-            print("  Interrupt: just speak — agent stops and listens")
+            print("  Interrupt: just speak -- agent stops and listens")
         print(f"  Output: {'text + voice' if not self.no_tts else 'text only'}")
         print(f"  Think:  \033[90mshown in gray\033[0m")
         print(f"  Tools:  \033[93mshown in yellow\033[0m")
@@ -945,7 +945,10 @@ class LiveAgent:
                             break
 
                 except KeyboardInterrupt:
-                    print("\n\n  Ctrl+C — shutting down.")
+                    print("\n\n  Ctrl+C -- shutting down.")
+                    break
+                except EOFError:
+                    print("\n  End of input -- shutting down.")
                     break
                 except Exception as e:
                     print(f"\n  \033[91m[error: {e}]\033[0m")
@@ -960,7 +963,7 @@ class LiveAgent:
                 mic_thread.join(timeout=2)
 
 
-# ── Main ────────────────────────────────────────────────────────────
+# -- Main ------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Living Agent")
@@ -989,14 +992,14 @@ def main():
     whisper_model = load_whisper(device=args.device) if not args.text else None
     tts_model = load_chatterbox(device=args.device) if not args.no_tts else None
 
-    # Load WhisperAdapter (audio → Thinker embedding space)
+    # Load WhisperAdapter (audio -> Thinker embedding space)
     adapter = None
     adapter_path = os.path.join(os.path.dirname(__file__), "..", "checkpoints", "adapter", "adapter_best.pt")
     if os.path.exists(adapter_path) and not args.text:
         try:
             adapter = load_adapter(adapter_path, device=args.device)
         except Exception as e:
-            print(f"  WhisperAdapter load failed: {e} — using text-only STT")
+            print(f"  WhisperAdapter load failed: {e} -- using text-only STT")
 
     # Load emotion probe
     probe = None
@@ -1024,9 +1027,9 @@ def main():
         connector = connector.to(args.device).eval()
         for p in connector.parameters():
             p.requires_grad = False
-        print(f"  Loaded in {time.time() - t0:.1f}s (direct hidden state → T3 path enabled)")
+        print(f"  Loaded in {time.time() - t0:.1f}s (direct hidden state -> T3 path enabled)")
     else:
-        print("  HiddenStateConnector not trained yet — using text path")
+        print("  HiddenStateConnector not trained yet -- using text path")
         print(f"  Train with: python -m src.training.train_stage4")
 
     if args.device == "cuda":
