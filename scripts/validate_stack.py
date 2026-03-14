@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Validate the full Thinker-Talker stack — every trained component.
+"""Validate the full Thinker-Talker stack -- every trained component.
 
 Tests each component individually, then end-to-end. Reports pass/fail
 with quality metrics so you know what's actually working.
 
 Components tested:
-  1. Thinker (LoRA) — text generation quality
-  2. Emotion Probe — emotion detection accuracy on known-emotion prompts
-  3. Connector — style mapping produces distinct params per emotion
-  4. TTS (Chatterbox) — generates intelligible speech (verified by Whisper)
-  5. Streaming — overlapped pipeline works and is faster
-  6. Full Loop — TTS → Whisper → Thinker → TTS → Whisper roundtrip
+  1. Thinker (LoRA) -- text generation quality
+  2. Emotion Probe -- emotion detection accuracy on known-emotion prompts
+  3. Connector -- style mapping produces distinct params per emotion
+  4. TTS (Chatterbox) -- generates intelligible speech (verified by Whisper)
+  5. Streaming -- overlapped pipeline works and is faster
+  6. Full Loop -- TTS -> Whisper -> Thinker -> TTS -> Whisper roundtrip
 
 Usage:
     CUDA_VISIBLE_DEVICES=1 python scripts/validate_stack.py
@@ -35,6 +35,18 @@ if not hasattr(torchaudio, 'list_audio_backends'):
 import torch
 import numpy as np
 import soundfile as sf
+import librosa
+
+
+def load_audio_np(path, sr=16000):
+    """Load audio as 16kHz mono float32 numpy array (what whisper expects).
+    Bypasses whisper's ffmpeg-based loader which fails on Windows."""
+    audio, orig_sr = sf.read(path, dtype="float32")
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    if orig_sr != sr:
+        audio = librosa.resample(audio, orig_sr=orig_sr, target_sr=sr)
+    return audio
 
 
 # ── Test prompts with expected emotions ──────────────────────────────
@@ -82,7 +94,7 @@ class ValidationReport:
             "detail": detail,
         })
         status = "PASS" if passed else "FAIL"
-        print(f"  [{status}] {test}" + (f" — {detail}" if detail else ""))
+        print(f"  [{status}] {test}" + (f" -- {detail}" if detail else ""))
 
     def summary(self):
         print(f"\n{'=' * 70}")
@@ -122,9 +134,9 @@ class ValidationReport:
 
 def validate_thinker(report, lora_path, device):
     """Validate that the Thinker generates coherent text."""
-    print(f"\n{'─' * 70}")
-    print("1. THINKER (LoRA) — Text Generation")
-    print(f"{'─' * 70}")
+    print(f"\n{'-' * 70}")
+    print("1. THINKER (LoRA) -- Text Generation")
+    print(f"{'-' * 70}")
 
     from unsloth import FastLanguageModel
 
@@ -165,9 +177,9 @@ def validate_thinker(report, lora_path, device):
 
 def validate_probe(report, lora_path, probe_ckpt, device):
     """Validate emotion probe accuracy on known-emotion prompts."""
-    print(f"\n{'─' * 70}")
-    print("2. EMOTION PROBE — Emotion Detection")
-    print(f"{'─' * 70}")
+    print(f"\n{'-' * 70}")
+    print("2. EMOTION PROBE -- Emotion Detection")
+    print(f"{'-' * 70}")
 
     import unsloth
     from unsloth import FastLanguageModel
@@ -271,9 +283,9 @@ def validate_probe(report, lora_path, probe_ckpt, device):
 
 def validate_connector(report):
     """Validate connector style mapping produces distinct params per emotion."""
-    print(f"\n{'─' * 70}")
-    print("3. CONNECTOR — Style Mapping")
-    print(f"{'─' * 70}")
+    print(f"\n{'-' * 70}")
+    print("3. CONNECTOR -- Style Mapping")
+    print(f"{'-' * 70}")
 
     from src.model.connector import ThinkerTalkerConnector, EMOTION_EXAGGERATION, EMOTION_TEMPERATURE
 
@@ -299,7 +311,7 @@ def validate_connector(report):
     # Test prosody influence
     base_style = connector.map_style("happy", prosody={"energy": 1.0})
     high_energy = connector.map_style("happy", prosody={"energy": 1.5})
-    report.add("Connector", "High energy → higher exaggeration",
+    report.add("Connector", "High energy -> higher exaggeration",
                high_energy["exaggeration"] >= base_style["exaggeration"],
                f"{high_energy['exaggeration']:.2f} vs {base_style['exaggeration']:.2f}")
 
@@ -313,9 +325,9 @@ def validate_connector(report):
 
 def validate_hidden_connector(report, lora_path, probe_ckpt, connector_ckpt, device):
     """Validate HiddenStateConnector projects Thinker states into T3 space."""
-    print(f"\n{'─' * 70}")
-    print("3b. HIDDEN STATE CONNECTOR — Thinker→T3 Projection")
-    print(f"{'─' * 70}")
+    print(f"\n{'-' * 70}")
+    print("3b. HIDDEN STATE CONNECTOR -- Thinker->T3 Projection")
+    print(f"{'-' * 70}")
 
     from src.model.connector import HiddenStateConnector
 
@@ -419,9 +431,9 @@ def validate_hidden_connector(report, lora_path, probe_ckpt, connector_ckpt, dev
 
 def validate_tts(report, voice_path, device):
     """Validate TTS produces intelligible speech (verified by Whisper)."""
-    print(f"\n{'─' * 70}")
-    print("4. TTS (Chatterbox) — Speech Generation + Intelligibility")
-    print(f"{'─' * 70}")
+    print(f"\n{'-' * 70}")
+    print("4. TTS (Chatterbox) -- Speech Generation + Intelligibility")
+    print(f"{'-' * 70}")
 
     from src.inference.streaming import StreamingTTSPipeline
 
@@ -429,8 +441,8 @@ def validate_tts(report, voice_path, device):
     pipeline = StreamingTTSPipeline.from_pretrained(device=device)
     pipeline.set_voice(voice_path)
 
-    # Load Whisper for verification
-    print("  Loading Whisper for verification...")
+    # Load faster-whisper for verification (works on Windows, unlike openai whisper)
+    print("  Loading faster-whisper for verification...")
     import whisper
     whisper_model = whisper.load_model("base", device=device)
 
@@ -463,8 +475,8 @@ def validate_tts(report, voice_path, device):
                    duration > 0.3 and gen_time < duration * 3,
                    f"realtime={gen_time/duration:.2f}x")
 
-        # Verify with Whisper
-        result = whisper_model.transcribe(wav_path)
+        # Verify with faster-whisper
+        result = whisper_model.transcribe(load_audio_np(wav_path))
         heard = result["text"].strip().lower()
         original = text.lower()
 
@@ -493,9 +505,9 @@ def validate_tts(report, voice_path, device):
 
 def validate_streaming(report, voice_path, device):
     """Validate streaming TTS works and has reasonable latency."""
-    print(f"\n{'─' * 70}")
-    print("5. STREAMING — Latency + Chunking")
-    print(f"{'─' * 70}")
+    print(f"\n{'-' * 70}")
+    print("5. STREAMING -- Latency + Chunking")
+    print(f"{'-' * 70}")
 
     from src.inference.streaming import StreamingTTSPipeline, find_clause_boundary
 
@@ -548,10 +560,10 @@ def validate_streaming(report, voice_path, device):
 
 
 def validate_full_loop(report, voice_path, lora_path, probe_ckpt, device):
-    """Full loop: TTS → Whisper → Thinker → TTS → Whisper."""
-    print(f"\n{'─' * 70}")
-    print("6. FULL LOOP — End-to-End Roundtrip")
-    print(f"{'─' * 70}")
+    """Full loop: TTS -> Whisper -> Thinker -> TTS -> Whisper."""
+    print(f"\n{'-' * 70}")
+    print("6. FULL LOOP -- End-to-End Roundtrip")
+    print(f"{'-' * 70}")
 
     from src.inference.streaming import StreamingTTSPipeline
 
@@ -562,7 +574,7 @@ def validate_full_loop(report, voice_path, lora_path, probe_ckpt, device):
     tts_pipeline = StreamingTTSPipeline.from_pretrained(device=device)
     tts_pipeline.set_voice(voice_path)
 
-    # Whisper
+    # Whisper (faster-whisper for Windows compatibility)
     import whisper
     whisper_model = whisper.load_model("base", device=device)
 
@@ -617,8 +629,8 @@ def validate_full_loop(report, voice_path, lora_path, probe_ckpt, device):
 
         # Step 2: Whisper transcribes user speech
         print(f"  [2] Whisper transcribing user speech...")
-        stt_result = whisper_model.transcribe(user_wav_path)
-        transcribed_input = stt_result["text"].strip()
+        result = whisper_model.transcribe(load_audio_np(user_wav_path))
+        transcribed_input = result["text"].strip()
         print(f"      Whisper heard: \"{transcribed_input}\"")
 
         report.add("Loop", f"STT user speech: \"{user_prompt[:30]}\"",
@@ -680,8 +692,8 @@ def validate_full_loop(report, voice_path, lora_path, probe_ckpt, device):
 
         # Step 5: Whisper verifies the response
         print(f"  [5] Whisper verifying response...")
-        verify_result = whisper_model.transcribe(response_wav_path)
-        verified_text = verify_result["text"].strip()
+        result = whisper_model.transcribe(load_audio_np(response_wav_path))
+        verified_text = result["text"].strip()
         print(f"      Whisper heard: \"{verified_text[:60]}\"")
 
         # Check that Whisper heard something related to what was said
