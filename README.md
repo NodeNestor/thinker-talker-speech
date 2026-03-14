@@ -111,6 +111,8 @@ Uses FiLM conditioning from the emotion probe + cross-attention for sequence ali
 python -m src.training.train_stage4 --lora-path checkpoints/living-agent/lora --probe-ckpt checkpoints/probe/probe_best.pt
 ```
 
+**Result**: Loss 5.10 -> **0.090** (cosine similarity ~82%)
+
 When trained, the connector activates automatically in `live_agent.py`. Falls back to text → T3 tokenizer path if checkpoint doesn't exist.
 
 ## Validation
