@@ -216,6 +216,21 @@ Validates the entire stack end-to-end — generates synthetic "user speech", tra
 CUDA_VISIBLE_DEVICES=1 python scripts/validate_stack.py --component loop --voice voice.wav
 ```
 
+### Demo Samples (AI-Generated End-to-End)
+
+These audio samples were generated entirely by AI — no human voice involved. The full loop test generates synthetic "user speech" with TTS, transcribes it with Whisper, feeds it to the Thinker, speaks the response with Chatterbox Turbo, and verifies intelligibility with Whisper again. Every step is AI.
+
+Audio files in [`data/demo_samples/`](data/demo_samples/):
+
+| File | What | Transcript |
+|------|------|-----------|
+| `loop_0_user.wav` | AI "user" asking a question | "What is the meaning of life?" |
+| `loop_0_response.wav` | Agent responds (16.2s, 89% intelligibility) | "Let me think about this for a bit..." |
+| `loop_1_user.wav` | AI "user" asking for humor | "Tell me something funny." |
+| `loop_1_response.wav` | Agent responds (21.8s, 76% intelligibility) | "Oh let me think about something..." |
+
+Pipeline: TTS generates speech → Whisper transcribes → Thinker thinks → TTS speaks response → Whisper verifies. 10/10 tests passed.
+
 ### Overlapped Streaming Benchmark
 
 Compare first-audio latency with and without pipelining:
